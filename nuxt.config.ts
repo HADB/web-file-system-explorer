@@ -8,7 +8,8 @@ export default defineNuxtConfig({
   eslint: { config: { standalone: false } },
   modules: ['@nuxt/eslint', '@nuxt/ui'],
   ssr: false,
-  ui: {
-    colorMode: false,
+  colorMode: {
+    preference: 'dark',
+    fallback: 'dark',
   },
 })
