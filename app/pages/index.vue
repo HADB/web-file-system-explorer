@@ -18,6 +18,15 @@ interface FileItem {
   type?: string
 }
 
+interface StoredDirectory {
+  id: string
+  name: string
+  handle: FileSystemDirectoryHandle
+  lastAccessed: Date
+}
+
+// 应用状态
+const currentView = ref<'home' | 'directory'>('home') // 当前视图：首页或目录浏览
 const directoryHandle = ref<FileSystemDirectoryHandle | null>(null)
 const currentPath = ref<string>('')
 const fileList = ref<FileItem[]>([])
@@ -25,6 +34,10 @@ const loading = ref(false)
 const uploading = ref(false)
 const uploadProgress = ref<{ [key: string]: number }>({})
 const toast = useToast()
+
+// 多目录管理
+const storedDirectories = ref<StoredDirectory[]>([])
+const currentDirectoryId = ref<string | null>(null)
 
 // 使用 useOverlay 创建模态框
 const overlay = useOverlay()
@@ -34,80 +47,574 @@ const isDragOver = ref(false)
 const uploadQueue = ref<File[]>([])
 const currentDirectory = ref<FileSystemDirectoryHandle | null>(null)
 
-// IndexedDB 相关函数
-const DIRECTORY_HANDLE_KEY = 'lastDirectoryHandle'
-
-// 保存目录句柄到 IndexedDB
-async function saveDirectoryHandle(handle: FileSystemDirectoryHandle) {
+// 保存目录到 IndexedDB
+async function saveDirectory(handle: FileSystemDirectoryHandle) {
   try {
     if (!('indexedDB' in window)) {
       return
     }
 
-    const request = indexedDB.open('FileSystemDB', 1)
-
-    request.onupgradeneeded = () => {
-      const db = request.result
-      if (!db.objectStoreNames.contains('handles')) {
-        db.createObjectStore('handles')
-      }
+    const id = crypto.randomUUID()
+    const directory: StoredDirectory = {
+      id,
+      name: handle.name,
+      handle,
+      lastAccessed: new Date(),
     }
 
-    request.onsuccess = () => {
-      const db = request.result
-      const transaction = db.transaction(['handles'], 'readwrite')
-      const store = transaction.objectStore('handles')
-      store.put(handle, DIRECTORY_HANDLE_KEY)
-      db.close()
-    }
-  }
-  catch (error) {
-    console.warn('无法保存目录句柄:', error)
-  }
-}
+    return new Promise((resolve, reject) => {
+      // 使用版本 3 来支持两个独立的对象存储
+      const request = indexedDB.open('FileSystemDB', 3)
 
-// 从 IndexedDB 恢复目录句柄
-async function restoreDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
-  try {
-    if (!('indexedDB' in window)) {
-      return null
-    }
-
-    return new Promise((resolve) => {
-      const request = indexedDB.open('FileSystemDB', 1)
-
-      request.onupgradeneeded = () => {
+      request.onupgradeneeded = (event) => {
         const db = request.result
-        if (!db.objectStoreNames.contains('handles')) {
-          db.createObjectStore('handles')
+        const oldVersion = event.oldVersion
+
+        console.log(`Upgrading database from version ${oldVersion} to 3`)
+
+        // 如果存在旧的 handles 表，删除它
+        if (db.objectStoreNames.contains('handles')) {
+          console.log('Deleting old handles object store')
+          db.deleteObjectStore('handles')
+        }
+
+        // 如果存在旧的 directories 表，删除它
+        if (db.objectStoreNames.contains('directories')) {
+          console.log('Deleting old directories object store')
+          db.deleteObjectStore('directories')
+        }
+
+        // 创建新的对象存储
+        if (!db.objectStoreNames.contains('directoryInfo')) {
+          console.log('Creating directoryInfo object store')
+          db.createObjectStore('directoryInfo', { keyPath: 'id' })
+        }
+
+        if (!db.objectStoreNames.contains('directoryHandles')) {
+          console.log('Creating directoryHandles object store')
+          db.createObjectStore('directoryHandles', { keyPath: 'id' })
         }
       }
 
       request.onsuccess = () => {
         const db = request.result
-        const transaction = db.transaction(['handles'], 'readonly')
-        const store = transaction.objectStore('handles')
-        const getRequest = store.get(DIRECTORY_HANDLE_KEY)
+        console.log('Database opened successfully, version:', db.version)
+        console.log('Available object stores:', Array.from(db.objectStoreNames))
 
-        getRequest.onsuccess = () => {
-          db.close()
-          resolve(getRequest.result || null)
+        // 创建一个简单的延迟函数
+        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+        const executeTransaction = async () => {
+          // 稍微延迟以确保数据库完全就绪
+          await delay(100)
+
+          try {
+            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readwrite')
+            const infoStore = transaction.objectStore('directoryInfo')
+            const handleStore = transaction.objectStore('directoryHandles')
+
+            // 分别存储可序列化的信息和 handle
+            const serializableInfo = {
+              id: directory.id,
+              name: directory.name,
+              lastAccessed: directory.lastAccessed,
+            }
+
+            const handleObject = {
+              id: directory.id,
+              handle,
+            }
+
+            const infoRequest = infoStore.put(serializableInfo)
+            const handleRequest = handleStore.put(handleObject)
+
+            let infoSuccess = false
+            let handleSuccess = false
+
+            infoRequest.onsuccess = async () => {
+              console.log('Directory info saved successfully:', directory.name)
+              infoSuccess = true
+              if (handleSuccess) {
+                db.close()
+
+                // 更新本地状态 - 使用 isSameEntry 方法进行精确比较
+                let existingIndex = -1
+                for (let i = 0; i < storedDirectories.value.length; i++) {
+                  try {
+                    const existingDir = storedDirectories.value[i]
+                    if (directory.handle && existingDir?.handle
+                      && await directory.handle.isSameEntry(existingDir.handle)) {
+                      existingIndex = i
+                      break
+                    }
+                  }
+                  catch (error) {
+                    // 如果比较失败，继续检查下一个
+                    console.warn('无法比较目录句柄:', error)
+                  }
+                }
+
+                if (existingIndex >= 0) {
+                  storedDirectories.value[existingIndex] = directory
+                }
+                else {
+                  storedDirectories.value.push(directory)
+                }
+
+                resolve(id)
+              }
+            }
+
+            handleRequest.onsuccess = async () => {
+              console.log('Directory handle saved successfully:', directory.name)
+              handleSuccess = true
+              if (infoSuccess) {
+                db.close()
+
+                // 更新本地状态 - 使用 isSameEntry 方法进行精确比较
+                let existingIndex = -1
+                for (let i = 0; i < storedDirectories.value.length; i++) {
+                  try {
+                    const existingDir = storedDirectories.value[i]
+                    if (directory.handle && existingDir?.handle
+                      && await directory.handle.isSameEntry(existingDir.handle)) {
+                      existingIndex = i
+                      break
+                    }
+                  }
+                  catch (error) {
+                    // 如果比较失败，继续检查下一个
+                    console.warn('无法比较目录句柄:', error)
+                  }
+                }
+
+                if (existingIndex >= 0) {
+                  storedDirectories.value[existingIndex] = directory
+                }
+                else {
+                  storedDirectories.value.push(directory)
+                }
+
+                resolve(id)
+              }
+            }
+
+            infoRequest.onerror = () => {
+              console.error('Failed to save directory info:', infoRequest.error)
+              db.close()
+              reject(infoRequest.error)
+            }
+
+            handleRequest.onerror = () => {
+              console.error('Failed to save directory handle:', handleRequest.error)
+              db.close()
+              reject(handleRequest.error)
+            }
+
+            transaction.onerror = () => {
+              console.error('Transaction error:', transaction.error)
+              db.close()
+              reject(transaction.error)
+            }
+          }
+          catch (error) {
+            console.error('Error executing transaction:', error)
+            db.close()
+            reject(error)
+          }
         }
 
-        getRequest.onerror = () => {
-          db.close()
-          resolve(null)
-        }
+        executeTransaction()
       }
 
       request.onerror = () => {
-        resolve(null)
+        console.error('Database open error:', request.error)
+        reject(request.error)
       }
     })
   }
   catch (error) {
-    console.warn('无法恢复目录句柄:', error)
+    console.warn('无法保存目录:', error)
     return null
+  }
+}
+
+// 从 IndexedDB 加载所有目录
+async function loadAllDirectories(): Promise<StoredDirectory[]> {
+  try {
+    if (!('indexedDB' in window)) {
+      return []
+    }
+
+    return new Promise((resolve) => {
+      // 使用版本 3 来确保数据库结构正确
+      const request = indexedDB.open('FileSystemDB', 3)
+
+      request.onupgradeneeded = (event) => {
+        const db = request.result
+        const oldVersion = event.oldVersion
+
+        console.log(`Upgrading database from version ${oldVersion} to 3`)
+
+        // 如果存在旧的 handles 表，删除它
+        if (db.objectStoreNames.contains('handles')) {
+          console.log('Deleting old handles object store')
+          db.deleteObjectStore('handles')
+        }
+
+        // 如果存在旧的 directories 表，删除它
+        if (db.objectStoreNames.contains('directories')) {
+          console.log('Deleting old directories object store')
+          db.deleteObjectStore('directories')
+        }
+
+        // 创建新的对象存储
+        if (!db.objectStoreNames.contains('directoryInfo')) {
+          console.log('Creating directoryInfo object store')
+          db.createObjectStore('directoryInfo', { keyPath: 'id' })
+        }
+
+        if (!db.objectStoreNames.contains('directoryHandles')) {
+          console.log('Creating directoryHandles object store')
+          db.createObjectStore('directoryHandles', { keyPath: 'id' })
+        }
+      }
+
+      request.onsuccess = () => {
+        const db = request.result
+        console.log('Database opened successfully for loading, version:', db.version)
+        console.log('Available object stores:', Array.from(db.objectStoreNames))
+
+        // 创建一个简单的延迟函数
+        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+        const executeTransaction = async () => {
+          // 稍微延迟以确保数据库完全就绪
+          await delay(100)
+
+          try {
+            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readonly')
+            const infoStore = transaction.objectStore('directoryInfo')
+            const handleStore = transaction.objectStore('directoryHandles')
+
+            const infoRequest = infoStore.getAll()
+            const handleRequest = handleStore.getAll()
+
+            let infoResults: any[] = []
+            let handleResults: any[] = []
+            let infoComplete = false
+            let handleComplete = false
+
+            const combineResults = () => {
+              try {
+                const directories: StoredDirectory[] = []
+
+                for (const info of infoResults) {
+                  const handleData = handleResults.find((h) => h.id === info.id)
+                  if (handleData && handleData.handle) {
+                    directories.push({
+                      id: info.id,
+                      name: info.name,
+                      lastAccessed: new Date(info.lastAccessed),
+                      handle: handleData.handle,
+                    })
+                  }
+                }
+
+                console.log('Loaded directories:', directories)
+                db.close()
+                resolve(directories)
+              }
+              catch (error) {
+                console.error('Error combining results:', error)
+                db.close()
+                resolve([])
+              }
+            }
+
+            infoRequest.onsuccess = () => {
+              infoResults = infoRequest.result || []
+              infoComplete = true
+              if (handleComplete) {
+                combineResults()
+              }
+            }
+
+            handleRequest.onsuccess = () => {
+              handleResults = handleRequest.result || []
+              handleComplete = true
+              if (infoComplete) {
+                combineResults()
+              }
+            }
+
+            infoRequest.onerror = () => {
+              console.error('Failed to load directory info:', infoRequest.error)
+              db.close()
+              resolve([])
+            }
+
+            handleRequest.onerror = () => {
+              console.error('Failed to load directory handles:', handleRequest.error)
+              db.close()
+              resolve([])
+            }
+
+            transaction.onerror = () => {
+              console.error('Transaction error:', transaction.error)
+              db.close()
+              resolve([])
+            }
+          }
+          catch (error) {
+            console.error('Error executing transaction:', error)
+            db.close()
+            resolve([])
+          }
+        }
+
+        executeTransaction()
+      }
+
+      request.onerror = () => {
+        console.error('Database open error:', request.error)
+        resolve([])
+      }
+    })
+  }
+  catch (error) {
+    console.warn('无法加载目录列表:', error)
+    return []
+  }
+}
+
+// 删除目录
+async function removeDirectory(id: string) {
+  try {
+    if (!('indexedDB' in window)) {
+      return
+    }
+
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FileSystemDB', 3)
+
+      request.onupgradeneeded = (event) => {
+        const db = request.result
+        const oldVersion = event.oldVersion
+
+        console.log(`Upgrading database from version ${oldVersion} to 3`)
+
+        // 如果存在旧的 handles 表，删除它
+        if (db.objectStoreNames.contains('handles')) {
+          console.log('Deleting old handles object store')
+          db.deleteObjectStore('handles')
+        }
+
+        // 如果存在旧的 directories 表，删除它
+        if (db.objectStoreNames.contains('directories')) {
+          console.log('Deleting old directories object store')
+          db.deleteObjectStore('directories')
+        }
+
+        // 创建新的对象存储
+        if (!db.objectStoreNames.contains('directoryInfo')) {
+          console.log('Creating directoryInfo object store')
+          db.createObjectStore('directoryInfo', { keyPath: 'id' })
+        }
+
+        if (!db.objectStoreNames.contains('directoryHandles')) {
+          console.log('Creating directoryHandles object store')
+          db.createObjectStore('directoryHandles', { keyPath: 'id' })
+        }
+      }
+
+      request.onsuccess = () => {
+        const db = request.result
+
+        // 创建一个简单的延迟函数
+        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+        const executeTransaction = async () => {
+          // 稍微延迟以确保数据库完全就绪
+          await delay(100)
+
+          try {
+            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readwrite')
+            const infoStore = transaction.objectStore('directoryInfo')
+            const handleStore = transaction.objectStore('directoryHandles')
+
+            const infoDeleteRequest = infoStore.delete(id)
+            const handleDeleteRequest = handleStore.delete(id)
+
+            let infoDeleted = false
+            let handleDeleted = false
+
+            infoDeleteRequest.onsuccess = () => {
+              console.log('Directory info deleted successfully')
+              infoDeleted = true
+              if (handleDeleted) {
+                db.close()
+
+                // 更新本地状态
+                storedDirectories.value = storedDirectories.value.filter((d) => d.id !== id)
+
+                resolve(true)
+              }
+            }
+
+            handleDeleteRequest.onsuccess = () => {
+              console.log('Directory handle deleted successfully')
+              handleDeleted = true
+              if (infoDeleted) {
+                db.close()
+
+                // 更新本地状态
+                storedDirectories.value = storedDirectories.value.filter((d) => d.id !== id)
+
+                resolve(true)
+              }
+            }
+
+            infoDeleteRequest.onerror = () => {
+              db.close()
+              reject(infoDeleteRequest.error)
+            }
+
+            handleDeleteRequest.onerror = () => {
+              db.close()
+              reject(handleDeleteRequest.error)
+            }
+
+            transaction.onerror = () => {
+              db.close()
+              reject(transaction.error)
+            }
+          }
+          catch (error) {
+            db.close()
+            reject(error)
+          }
+        }
+
+        executeTransaction()
+      }
+
+      request.onerror = () => {
+        reject(request.error)
+      }
+    })
+  }
+  catch (error) {
+    console.warn('无法删除目录:', error)
+  }
+}
+
+// 更新目录最后访问时间
+async function updateDirectoryAccess(id: string) {
+  try {
+    if (!('indexedDB' in window)) {
+      return
+    }
+
+    const directory = storedDirectories.value.find((d) => d.id === id)
+    if (!directory) {
+      return
+    }
+
+    directory.lastAccessed = new Date()
+
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('FileSystemDB', 3)
+
+      request.onupgradeneeded = (event) => {
+        const db = request.result
+        const oldVersion = event.oldVersion
+
+        console.log(`Upgrading database from version ${oldVersion} to 3`)
+
+        // 如果存在旧的 handles 表，删除它
+        if (db.objectStoreNames.contains('handles')) {
+          console.log('Deleting old handles object store')
+          db.deleteObjectStore('handles')
+        }
+
+        // 如果存在旧的 directories 表，删除它
+        if (db.objectStoreNames.contains('directories')) {
+          console.log('Deleting old directories object store')
+          db.deleteObjectStore('directories')
+        }
+
+        // 创建新的对象存储
+        if (!db.objectStoreNames.contains('directoryInfo')) {
+          console.log('Creating directoryInfo object store')
+          db.createObjectStore('directoryInfo', { keyPath: 'id' })
+        }
+
+        if (!db.objectStoreNames.contains('directoryHandles')) {
+          console.log('Creating directoryHandles object store')
+          db.createObjectStore('directoryHandles', { keyPath: 'id' })
+        }
+      }
+
+      request.onsuccess = () => {
+        const db = request.result
+
+        // 创建一个简单的延迟函数
+        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+        const executeTransaction = async () => {
+          // 稍微延迟以确保数据库完全就绪
+          await delay(100)
+
+          try {
+            const transaction = db.transaction(['directoryInfo'], 'readwrite')
+            const infoStore = transaction.objectStore('directoryInfo')
+
+            // 只更新可序列化的信息，不需要更新 handle
+            const serializableInfo = {
+              id: directory.id,
+              name: directory.name,
+              lastAccessed: directory.lastAccessed,
+            }
+
+            const putRequest = infoStore.put(serializableInfo)
+
+            putRequest.onsuccess = () => {
+              console.log('Directory access time updated successfully:', directory.name)
+              db.close()
+              resolve(true)
+            }
+
+            putRequest.onerror = () => {
+              console.error('Failed to update directory access time:', putRequest.error)
+              db.close()
+              reject(putRequest.error)
+            }
+
+            transaction.onerror = () => {
+              console.error('Transaction error:', transaction.error)
+              db.close()
+              reject(transaction.error)
+            }
+          }
+          catch (error) {
+            console.error('Error executing transaction:', error)
+            db.close()
+            reject(error)
+          }
+        }
+
+        executeTransaction()
+      }
+
+      request.onerror = () => {
+        console.error('Database open error:', request.error)
+        reject(request.error)
+      }
+    })
+  }
+  catch (error) {
+    console.warn('无法更新目录访问时间:', error)
   }
 }
 
@@ -115,14 +622,14 @@ async function restoreDirectoryHandle(): Promise<FileSystemDirectoryHandle | nul
 async function verifyDirectoryHandle(handle: FileSystemDirectoryHandle): Promise<boolean> {
   try {
     // 尝试获取权限
-    const permission = await (handle as any).queryPermission({ mode: 'read' })
+    const permission = await (handle as any).queryPermission({ mode: 'readwrite' })
     if (permission === 'granted') {
       return true
     }
 
     // 如果权限是 'prompt'，尝试请求权限
     if (permission === 'prompt') {
-      const requestPermission = await (handle as any).requestPermission({ mode: 'read' })
+      const requestPermission = await (handle as any).requestPermission({ mode: 'readwrite' })
       return requestPermission === 'granted'
     }
 
@@ -134,7 +641,54 @@ async function verifyDirectoryHandle(handle: FileSystemDirectoryHandle): Promise
   }
 }
 
-// 验证目录句柄是否有写入权限
+// 进入指定目录（用户交互触发）
+async function enterDirectory(directoryData: StoredDirectory) {
+  loading.value = true
+  try {
+    const isValid = await verifyDirectoryHandle(directoryData.handle)
+    if (isValid) {
+      directoryHandle.value = directoryData.handle
+      currentDirectory.value = directoryData.handle
+      currentPath.value = directoryData.handle.name
+      currentDirectoryId.value = directoryData.id
+      currentView.value = 'directory'
+
+      await loadDirectoryContents(directoryData.handle)
+      await updateDirectoryAccess(directoryData.id)
+    }
+    else {
+      // 权限失效，从列表中移除
+      await removeDirectory(directoryData.id)
+
+      toast.add({
+        title: '目录权限已失效',
+        description: '目录权限已失效，已从列表中移除',
+        color: 'warning',
+      })
+    }
+  }
+  catch (error) {
+    console.error('进入目录失败:', error)
+    toast.add({
+      title: '进入目录失败',
+      description: '无法访问该目录，请重新授权',
+      color: 'error',
+    })
+  }
+  finally {
+    loading.value = false
+  }
+}
+
+// 返回首页
+function goHome() {
+  currentView.value = 'home'
+  directoryHandle.value = null
+  currentDirectory.value = null
+  currentPath.value = ''
+  currentDirectoryId.value = null
+  fileList.value = []
+}// 验证目录句柄是否有写入权限
 async function verifyWritePermission(handle: FileSystemDirectoryHandle): Promise<boolean> {
   try {
     // 尝试获取写入权限
@@ -169,8 +723,8 @@ declare global {
   }
 }
 
-// 选择目录
-async function selectDirectory() {
+// 选择并添加新目录
+async function addNewDirectory() {
   if (!isSupported.value) {
     toast.add({
       title: '浏览器不支持',
@@ -182,25 +736,45 @@ async function selectDirectory() {
 
   try {
     loading.value = true
-    directoryHandle.value = await window.showDirectoryPicker()
-    currentDirectory.value = directoryHandle.value
-    currentPath.value = directoryHandle.value.name
+    const handle = await window.showDirectoryPicker()
 
-    // 保存目录句柄
-    await saveDirectoryHandle(directoryHandle.value)
+    // 检查是否已经添加过这个目录 - 使用 isSameEntry 方法进行精确比较
+    let exists = false
+    for (const existingDir of storedDirectories.value) {
+      try {
+        if (await handle.isSameEntry(existingDir.handle)) {
+          exists = true
+          break
+        }
+      }
+      catch (error) {
+        // 如果比较失败（可能是权限问题），继续检查下一个
+        console.warn('无法比较目录句柄:', error)
+      }
+    }
 
-    await loadDirectoryContents(directoryHandle.value)
+    if (exists) {
+      toast.add({
+        title: '目录已存在',
+        description: `目录 "${handle.name}" 已经在列表中`,
+        color: 'warning',
+      })
+      return
+    }
+
+    // 保存目录
+    await saveDirectory(handle)
 
     toast.add({
-      title: '目录选择成功',
-      description: `已选择目录: ${directoryHandle.value.name}`,
+      title: '目录添加成功',
+      description: `已添加目录: ${handle.name}`,
       color: 'success',
     })
   }
   catch (error: any) {
     if (error.name !== 'AbortError') {
       toast.add({
-        title: '选择目录失败',
+        title: '添加目录失败',
         description: error.message,
         color: 'error',
       })
@@ -318,8 +892,8 @@ function getFileIcon(item: FileItem): string {
   return iconMap[ext || ''] || '📄'
 }
 
-// 进入目录
-async function enterDirectory(item: FileItem) {
+// 进入子目录
+async function enterSubDirectory(item: FileItem) {
   if (item.kind === 'directory') {
     currentPath.value += `/${item.name}`
     currentDirectory.value = item.handle as FileSystemDirectoryHandle
@@ -698,39 +1272,18 @@ async function goBack() {
   }
 }
 
-// 页面挂载时尝试恢复上次的目录
+// 页面挂载时加载已授权的目录列表
 onMounted(async () => {
   if (!isSupported.value) {
     return
   }
 
   try {
-    const savedHandle = await restoreDirectoryHandle()
-    if (savedHandle) {
-      const isValid = await verifyDirectoryHandle(savedHandle)
-      if (isValid) {
-        directoryHandle.value = savedHandle
-        currentDirectory.value = savedHandle
-        currentPath.value = savedHandle.name
-        await loadDirectoryContents(savedHandle)
-
-        toast.add({
-          title: '目录已恢复',
-          description: `已恢复上次访问的目录: ${savedHandle.name}`,
-          color: 'success',
-        })
-      }
-      else {
-        toast.add({
-          title: '目录权限已失效',
-          description: '上次访问的目录权限已失效，请重新选择目录',
-          color: 'warning',
-        })
-      }
-    }
+    const directories = await loadAllDirectories()
+    storedDirectories.value = directories
   }
   catch (error) {
-    console.warn('恢复目录失败:', error)
+    console.warn('加载目录列表失败:', error)
   }
 })
 </script>
@@ -741,55 +1294,6 @@ onMounted(async () => {
       <h1 class="text-3xl font-bold mb-8 text-gray-100">
         文件浏览器
       </h1>
-
-      <!-- 顶部操作栏 -->
-      <UCard class="mb-6">
-        <div class="flex justify-between items-center">
-          <div class="flex items-center space-x-3">
-            <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
-            <span class="font-mono bg-gray-800 px-3 py-1 rounded border border-gray-700 text-sm text-gray-200">
-              {{ currentPath || '未选择目录' }}
-            </span>
-          </div>
-          <div class="flex gap-3">
-            <UButton
-              v-if="currentPath && currentPath.includes('/')"
-              :disabled="loading"
-              variant="outline"
-              icon="i-heroicons-arrow-left"
-              @click="goBack"
-            >
-              返回上级
-            </UButton>
-            <UButton
-              v-if="directoryHandle"
-              :disabled="loading || uploading"
-              color="info"
-              icon="i-heroicons-folder-plus"
-              @click="createNewFolder"
-            >
-              新建文件夹
-            </UButton>
-            <UButton
-              v-if="directoryHandle"
-              :disabled="loading || uploading"
-              color="success"
-              icon="i-heroicons-arrow-up-tray"
-              @click="selectFilesToUpload"
-            >
-              上传文件
-            </UButton>
-            <UButton
-              :loading="loading"
-              color="primary"
-              icon="i-heroicons-folder-open"
-              @click="selectDirectory"
-            >
-              选择目录
-            </UButton>
-          </div>
-        </div>
-      </UCard>
 
       <!-- 浏览器支持提示 -->
       <UAlert
@@ -802,165 +1306,316 @@ onMounted(async () => {
         class="mb-6"
       />
 
-      <!-- 文件列表 -->
-      <UCard
-        v-if="isSupported && directoryHandle"
-        class="mb-6"
-        :class="{ 'border-2 border-dashed border-primary-500 bg-primary-50/10': isDragOver }"
-        @dragover="handleDragOver"
-        @dragleave="handleDragLeave"
-        @drop="handleDrop"
-      >
-        <template #header>
+      <!-- 首页：目录列表 -->
+      <div v-if="isSupported && currentView === 'home'">
+        <!-- 顶部操作栏 -->
+        <UCard class="mb-6">
           <div class="flex justify-between items-center">
-            <h2 class="text-lg font-semibold">
-              文件列表
-            </h2>
-            <div class="flex items-center gap-3">
-              <UBadge
-                v-if="uploading"
-                color="warning"
-                variant="subtle"
+            <div class="flex items-center space-x-3">
+              <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
+              <span class="text-lg font-semibold text-gray-200">已授权的目录</span>
+            </div>
+            <div class="flex gap-3">
+              <UButton
+                :loading="loading"
+                color="primary"
+                icon="i-heroicons-plus"
+                @click="addNewDirectory"
               >
-                正在上传 {{ Object.keys(uploadProgress).length }} 个文件
-              </UBadge>
+                添加目录
+              </UButton>
+            </div>
+          </div>
+        </UCard>
+
+        <!-- 目录列表 -->
+        <UCard v-if="storedDirectories.length > 0">
+          <template #header>
+            <div class="flex justify-between items-center">
+              <h2 class="text-lg font-semibold">
+                目录列表
+              </h2>
               <UBadge color="neutral" variant="subtle">
-                {{ fileList.length }} 个项目
+                {{ storedDirectories.length }} 个目录
               </UBadge>
             </div>
-          </div>
-        </template>
+          </template>
 
-        <!-- 拖拽上传提示 -->
-        <div
-          v-if="isDragOver"
-          class="absolute inset-0 bg-primary-500/20 flex items-center justify-center z-10 rounded-lg border-2 border-dashed border-primary-500"
-        >
-          <div class="text-center">
-            <UIcon name="i-heroicons-arrow-up-tray" class="text-4xl text-primary-500 mb-2" />
-            <p class="text-lg font-semibold text-primary-600">
-              释放文件以上传
-            </p>
-          </div>
-        </div>
-
-        <!-- 上传进度显示 -->
-        <div v-if="uploading && Object.keys(uploadProgress).length > 0" class="mb-4 p-4 bg-gray-800 rounded-lg">
-          <h3 class="text-sm font-semibold mb-3 text-gray-200">
-            上传进度
-          </h3>
-          <div class="space-y-2">
+          <div class="space-y-3">
             <div
-              v-for="(progress, fileName) in uploadProgress"
-              :key="fileName"
-              class="flex items-center justify-between text-sm"
+              v-for="directory in storedDirectories"
+              :key="directory.id"
+              class="flex items-center justify-between p-4 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700 cursor-pointer"
+              @click="enterDirectory(directory)"
             >
-              <span class="text-gray-300 truncate flex-1 mr-3">{{ fileName }}</span>
-              <div class="flex items-center gap-2">
-                <div class="w-20 bg-gray-700 rounded-full h-2">
-                  <div
-                    class="h-2 rounded-full transition-all duration-300"
-                    :class="{
-                      'bg-green-500': progress === 100,
-                      'bg-red-500': progress === -1,
-                      'bg-blue-500': progress > 0 && progress < 100,
-                      'bg-gray-500': progress === 0,
-                    }"
-                    :style="{ width: `${Math.max(0, progress)}%` }"
-                  />
+              <div class="flex items-center space-x-4">
+                <span class="text-2xl">📁</span>
+                <div>
+                  <h3 class="font-semibold text-gray-200">
+                    {{ directory.name }}
+                  </h3>
+                  <p class="text-sm text-gray-400">
+                    最后访问: {{ directory.lastAccessed.toLocaleDateString() }}
+                  </p>
                 </div>
-                <span
-                  class="text-xs w-12 text-right"
-                  :class="{
-                    'text-green-400': progress === 100,
-                    'text-red-400': progress === -1,
-                    'text-blue-400': progress > 0 && progress < 100,
-                    'text-gray-400': progress === 0,
-                  }"
+              </div>
+              <div class="flex items-center space-x-2">
+                <UButton
+                  size="xs"
+                  variant="ghost"
+                  color="primary"
+                  icon="i-heroicons-folder-open"
+                  @click.stop="enterDirectory(directory)"
                 >
-                  {{ progress === -1 ? '跳过' : progress === 0 ? '等待' : `${progress}%` }}
-                </span>
+                  进入
+                </UButton>
+                <UButton
+                  size="xs"
+                  variant="ghost"
+                  color="error"
+                  icon="i-heroicons-trash"
+                  @click.stop="removeDirectory(directory.id)"
+                >
+                  移除
+                </UButton>
               </div>
             </div>
           </div>
-        </div>
+        </UCard>
 
-        <div v-if="loading" class="flex justify-center items-center py-12">
-          <UIcon name="i-heroicons-arrow-path" class="animate-spin text-2xl text-primary-500 mr-2" />
-          <span class="text-gray-400">加载中...</span>
-        </div>
-
-        <div v-else-if="fileList.length === 0" class="py-12">
-          <div class="text-center">
+        <!-- 空状态 -->
+        <UCard v-else>
+          <div class="py-12 text-center">
             <div class="text-6xl text-gray-600 mb-4">
-              📁
+              📂
             </div>
-            <p class="text-gray-400 text-lg">
-              目录为空
+            <h3 class="text-lg font-semibold text-gray-300 mb-2">
+              还没有授权的目录
+            </h3>
+            <p class="text-gray-400 mb-6">
+              点击"添加目录"按钮来选择并授权一个本地目录
             </p>
+            <UButton
+              color="primary"
+              icon="i-heroicons-plus"
+              @click="addNewDirectory"
+            >
+              添加第一个目录
+            </UButton>
           </div>
-        </div>
+        </UCard>
+      </div>
 
-        <div v-else class="space-y-1">
+      <!-- 目录浏览视图 -->
+      <div v-if="isSupported && currentView === 'directory'">
+        <!-- 顶部操作栏 -->
+        <UCard class="mb-6">
+          <div class="flex justify-between items-center">
+            <div class="flex items-center space-x-3">
+              <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
+              <span class="font-mono bg-gray-800 px-3 py-1 rounded border border-gray-700 text-sm text-gray-200">
+                {{ currentPath || '未选择目录' }}
+              </span>
+            </div>
+            <div class="flex gap-3">
+              <UButton
+                :disabled="loading"
+                variant="outline"
+                icon="i-heroicons-home"
+                @click="goHome"
+              >
+                返回首页
+              </UButton>
+              <UButton
+                v-if="currentPath && currentPath.includes('/')"
+                :disabled="loading"
+                variant="outline"
+                icon="i-heroicons-arrow-left"
+                @click="goBack"
+              >
+                返回上级
+              </UButton>
+              <UButton
+                v-if="directoryHandle"
+                :disabled="loading || uploading"
+                color="info"
+                icon="i-heroicons-folder-plus"
+                @click="createNewFolder"
+              >
+                新建文件夹
+              </UButton>
+              <UButton
+                v-if="directoryHandle"
+                :disabled="loading || uploading"
+                color="success"
+                icon="i-heroicons-arrow-up-tray"
+                @click="selectFilesToUpload"
+              >
+                上传文件
+              </UButton>
+            </div>
+          </div>
+        </UCard>
+
+        <!-- 文件列表 -->
+        <UCard
+          class="mb-6"
+          :class="{ 'border-2 border-dashed border-primary-500 bg-primary-50/10': isDragOver }"
+          @dragover="handleDragOver"
+          @dragleave="handleDragLeave"
+          @drop="handleDrop"
+        >
+          <template #header>
+            <div class="flex justify-between items-center">
+              <h2 class="text-lg font-semibold">
+                文件列表
+              </h2>
+              <div class="flex items-center gap-3">
+                <UBadge
+                  v-if="uploading"
+                  color="warning"
+                  variant="subtle"
+                >
+                  正在上传 {{ Object.keys(uploadProgress).length }} 个文件
+                </UBadge>
+                <UBadge color="neutral" variant="subtle">
+                  {{ fileList.length }} 个项目
+                </UBadge>
+              </div>
+            </div>
+          </template>
+
+          <!-- 拖拽上传提示 -->
           <div
-            v-for="item in fileList"
-            :key="item.name"
-            class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700"
-            :class="{ 'cursor-pointer': item.kind === 'directory' }"
-            @click="item.kind === 'directory' ? enterDirectory(item) : null"
+            v-if="isDragOver"
+            class="absolute inset-0 bg-primary-500/20 flex items-center justify-center z-10 rounded-lg border-2 border-dashed border-primary-500"
           >
-            <div class="flex items-center space-x-3 min-w-0 flex-1">
-              <span class="text-xl flex-shrink-0">{{ getFileIcon(item) }}</span>
-              <div class="min-w-0 flex-1">
-                <p class="font-mono text-sm truncate text-gray-200">
-                  {{ item.name }}
-                </p>
-                <div class="flex items-center space-x-4 text-xs text-gray-400 mt-1">
-                  <UBadge :color="item.kind === 'directory' ? 'primary' : 'neutral'" variant="subtle" size="xs">
-                    {{ item.kind === 'directory' ? '目录' : '文件' }}
-                  </UBadge>
-                  <span v-if="item.kind === 'file' && item.size !== undefined">
-                    {{ formatFileSize(item.size) }}
-                  </span>
-                  <span v-if="item.lastModified">
-                    {{ item.lastModified.toLocaleDateString() }}
+            <div class="text-center">
+              <UIcon name="i-heroicons-arrow-up-tray" class="text-4xl text-primary-500 mb-2" />
+              <p class="text-lg font-semibold text-primary-600">
+                释放文件以上传
+              </p>
+            </div>
+          </div>
+
+          <!-- 上传进度显示 -->
+          <div v-if="uploading && Object.keys(uploadProgress).length > 0" class="mb-4 p-4 bg-gray-800 rounded-lg">
+            <h3 class="text-sm font-semibold mb-3 text-gray-200">
+              上传进度
+            </h3>
+            <div class="space-y-2">
+              <div
+                v-for="(progress, fileName) in uploadProgress"
+                :key="fileName"
+                class="flex items-center justify-between text-sm"
+              >
+                <span class="text-gray-300 truncate flex-1 mr-3">{{ fileName }}</span>
+                <div class="flex items-center gap-2">
+                  <div class="w-20 bg-gray-700 rounded-full h-2">
+                    <div
+                      class="h-2 rounded-full transition-all duration-300"
+                      :class="{
+                        'bg-green-500': progress === 100,
+                        'bg-red-500': progress === -1,
+                        'bg-blue-500': progress > 0 && progress < 100,
+                        'bg-gray-500': progress === 0,
+                      }"
+                      :style="{ width: `${Math.max(0, progress)}%` }"
+                    />
+                  </div>
+                  <span
+                    class="text-xs w-12 text-right"
+                    :class="{
+                      'text-green-400': progress === 100,
+                      'text-red-400': progress === -1,
+                      'text-blue-400': progress > 0 && progress < 100,
+                      'text-gray-400': progress === 0,
+                    }"
+                  >
+                    {{ progress === -1 ? '跳过' : progress === 0 ? '等待' : `${progress}%` }}
                   </span>
                 </div>
               </div>
             </div>
-            <div class="flex items-center space-x-2 flex-shrink-0">
-              <UButton
-                v-if="item.kind === 'file'"
-                size="xs"
-                variant="ghost"
-                icon="i-heroicons-eye"
-                @click.stop="previewFileContent(item)"
-              >
-                预览
-              </UButton>
-              <UButton
-                v-if="item.kind === 'file'"
-                size="xs"
-                variant="ghost"
-                color="success"
-                icon="i-heroicons-arrow-down-tray"
-                @click.stop="downloadFile(item)"
-              >
-                下载
-              </UButton>
-              <UButton
-                size="xs"
-                variant="ghost"
-                color="error"
-                icon="i-heroicons-trash"
-                @click.stop="deleteItem(item)"
-              >
-                删除
-              </UButton>
+          </div>
+
+          <div v-if="loading" class="flex justify-center items-center py-12">
+            <UIcon name="i-heroicons-arrow-path" class="animate-spin text-2xl text-primary-500 mr-2" />
+            <span class="text-gray-400">加载中...</span>
+          </div>
+
+          <div v-else-if="fileList.length === 0" class="py-12">
+            <div class="text-center">
+              <div class="text-6xl text-gray-600 mb-4">
+                📁
+              </div>
+              <p class="text-gray-400 text-lg">
+                目录为空
+              </p>
             </div>
           </div>
-        </div>
-      </UCard>
+
+          <div v-else class="space-y-1">
+            <div
+              v-for="item in fileList"
+              :key="item.name"
+              class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700"
+              :class="{ 'cursor-pointer': item.kind === 'directory' }"
+              @click="item.kind === 'directory' ? enterSubDirectory(item) : null"
+            >
+              <div class="flex items-center space-x-3 min-w-0 flex-1">
+                <span class="text-xl flex-shrink-0">{{ getFileIcon(item) }}</span>
+                <div class="min-w-0 flex-1">
+                  <p class="font-mono text-sm truncate text-gray-200">
+                    {{ item.name }}
+                  </p>
+                  <div class="flex items-center space-x-4 text-xs text-gray-400 mt-1">
+                    <UBadge :color="item.kind === 'directory' ? 'primary' : 'neutral'" variant="subtle" size="xs">
+                      {{ item.kind === 'directory' ? '目录' : '文件' }}
+                    </UBadge>
+                    <span v-if="item.kind === 'file' && item.size !== undefined">
+                      {{ formatFileSize(item.size) }}
+                    </span>
+                    <span v-if="item.lastModified">
+                      {{ item.lastModified.toLocaleDateString() }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div class="flex items-center space-x-2 flex-shrink-0">
+                <UButton
+                  v-if="item.kind === 'file'"
+                  size="xs"
+                  variant="ghost"
+                  icon="i-heroicons-eye"
+                  @click.stop="previewFileContent(item)"
+                >
+                  预览
+                </UButton>
+                <UButton
+                  v-if="item.kind === 'file'"
+                  size="xs"
+                  variant="ghost"
+                  color="success"
+                  icon="i-heroicons-arrow-down-tray"
+                  @click.stop="downloadFile(item)"
+                >
+                  下载
+                </UButton>
+                <UButton
+                  size="xs"
+                  variant="ghost"
+                  color="error"
+                  icon="i-heroicons-trash"
+                  @click.stop="deleteItem(item)"
+                >
+                  删除
+                </UButton>
+              </div>
+            </div>
+          </div>
+        </UCard>
+      </div>
     </div>
   </div>
 </template>
