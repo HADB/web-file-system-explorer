@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { FileItem, StoredDirectory } from '~~/types'
+
 useHead({
   title: '文件浏览器',
   meta: [
@@ -8,22 +10,6 @@ useHead({
     },
   ],
 })
-
-interface FileItem {
-  name: string
-  kind: 'file' | 'directory'
-  handle: FileSystemFileHandle | FileSystemDirectoryHandle
-  size?: number
-  lastModified?: Date
-  type?: string
-}
-
-interface StoredDirectory {
-  id: string
-  name: string
-  handle: FileSystemDirectoryHandle
-  lastAccessed: Date
-}
 
 // 应用状态
 const currentView = ref<'home' | 'directory'>('home') // 当前视图：首页或目录浏览
