@@ -170,10 +170,21 @@ export async function getDirectoryHandle(id: string) {
   return await get<FileSystemDirectoryHandle>(id)
 }
 
+/**
+ * 移除目录句柄
+ * @param id 目录 ID
+ * @returns 如果移除成功，返回 true；否则返回 false
+ */
 export async function removeDirectoryHandle(id: string) {
   return await get(id) && await del(id)
 }
 
+/**
+ * 比较两个文件系统条目是否相同
+ * @param handle1 文件系统句柄 1
+ * @param handle2 文件系统句柄 2
+ * @returns 如果两个条目相同，返回 true；否则返回 false
+ */
 export async function isSameEntry(handle1?: FileSystemHandle, handle2?: FileSystemHandle) {
   return handle1 && handle2 && await handle1.isSameEntry(handle2)
 }
