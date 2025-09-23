@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { useStorage } from '@vueuse/core'
+
 useHead({
   title: '文件浏览器',
   meta: [
@@ -11,17 +13,16 @@ useHead({
 
 // 应用状态
 const currentView = ref<'home' | 'directory'>('home') // 当前视图：首页或目录浏览
-const directoryHandle = ref<FileSystemDirectoryHandle | null>(null)
-const currentPath = ref<string>('')
+const storedDirectories = useStorage<StoredDirectoryInfo[]>('storedDirectories', () => [])
+const currentPathDirectories = reactive<{ name: string, handle: FileSystemDirectoryHandle }[]>([])
 const fileList = ref<EntryItem[]>([])
 const loading = ref(false)
 const uploading = ref(false)
 const uploadProgress = ref<{ [key: string]: number }>({})
 const toast = useToast()
-
-// 多目录管理
-const storedDirectories = ref<StoredDirectory[]>([])
-const currentDirectoryId = ref<string | null>(null)
+const currentPath = computed(() => {
+  return currentPathDirectories.map((dir) => dir.name).join('/')
+})
 
 // 使用 useOverlay 创建模态框
 const overlay = useOverlay()
@@ -29,480 +30,21 @@ const overlay = useOverlay()
 // 拖拽上传相关状态
 const isDragOver = ref(false)
 const uploadQueue = ref<File[]>([])
-const currentDirectory = ref<FileSystemDirectoryHandle | null>(null)
 
-// 保存目录到 IndexedDB
-async function saveDirectory(handle: FileSystemDirectoryHandle) {
-  try {
-    if (!('indexedDB' in window)) {
-      return
-    }
-
-    const id = crypto.randomUUID()
-    const directory: StoredDirectory = {
-      id,
-      name: handle.name,
-      handle,
-    }
-
-    return new Promise((resolve, reject) => {
-      // 使用版本 3 来支持两个独立的对象存储
-      const request = indexedDB.open('FileSystemDB', 3)
-
-      request.onupgradeneeded = (event) => {
-        const db = request.result
-        const oldVersion = event.oldVersion
-
-        console.log(`Upgrading database from version ${oldVersion} to 3`)
-
-        // 如果存在旧的 handles 表，删除它
-        if (db.objectStoreNames.contains('handles')) {
-          console.log('Deleting old handles object store')
-          db.deleteObjectStore('handles')
-        }
-
-        // 如果存在旧的 directories 表，删除它
-        if (db.objectStoreNames.contains('directories')) {
-          console.log('Deleting old directories object store')
-          db.deleteObjectStore('directories')
-        }
-
-        // 创建新的对象存储
-        if (!db.objectStoreNames.contains('directoryInfo')) {
-          console.log('Creating directoryInfo object store')
-          db.createObjectStore('directoryInfo', { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains('directoryHandles')) {
-          console.log('Creating directoryHandles object store')
-          db.createObjectStore('directoryHandles', { keyPath: 'id' })
-        }
-      }
-
-      request.onsuccess = () => {
-        const db = request.result
-        console.log('Database opened successfully, version:', db.version)
-        console.log('Available object stores:', Array.from(db.objectStoreNames))
-
-        // 创建一个简单的延迟函数
-        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-        const executeTransaction = async () => {
-          // 稍微延迟以确保数据库完全就绪
-          await delay(100)
-
-          try {
-            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readwrite')
-            const infoStore = transaction.objectStore('directoryInfo')
-            const handleStore = transaction.objectStore('directoryHandles')
-
-            // 分别存储可序列化的信息和 handle
-            const serializableInfo = {
-              id: directory.id,
-              name: directory.name,
-            }
-
-            const handleObject = {
-              id: directory.id,
-              handle,
-            }
-
-            const infoRequest = infoStore.put(serializableInfo)
-            const handleRequest = handleStore.put(handleObject)
-
-            let infoSuccess = false
-            let handleSuccess = false
-
-            infoRequest.onsuccess = async () => {
-              console.log('Directory info saved successfully:', directory.name)
-              infoSuccess = true
-              if (handleSuccess) {
-                db.close()
-
-                // 更新本地状态 - 使用 isSameEntry 方法进行精确比较
-                let existingIndex = -1
-                for (let i = 0; i < storedDirectories.value.length; i++) {
-                  try {
-                    const existingDir = storedDirectories.value[i]
-                    if (directory.handle && existingDir?.handle
-                      && await directory.handle.isSameEntry(existingDir.handle)) {
-                      existingIndex = i
-                      break
-                    }
-                  }
-                  catch (error) {
-                    // 如果比较失败，继续检查下一个
-                    console.warn('无法比较目录句柄:', error)
-                  }
-                }
-
-                if (existingIndex >= 0) {
-                  storedDirectories.value[existingIndex] = directory
-                }
-                else {
-                  storedDirectories.value.push(directory)
-                }
-
-                resolve(id)
-              }
-            }
-
-            handleRequest.onsuccess = async () => {
-              console.log('Directory handle saved successfully:', directory.name)
-              handleSuccess = true
-              if (infoSuccess) {
-                db.close()
-
-                // 更新本地状态 - 使用 isSameEntry 方法进行精确比较
-                let existingIndex = -1
-                for (let i = 0; i < storedDirectories.value.length; i++) {
-                  try {
-                    const existingDir = storedDirectories.value[i]
-                    if (directory.handle && existingDir?.handle
-                      && await directory.handle.isSameEntry(existingDir.handle)) {
-                      existingIndex = i
-                      break
-                    }
-                  }
-                  catch (error) {
-                    // 如果比较失败，继续检查下一个
-                    console.warn('无法比较目录句柄:', error)
-                  }
-                }
-
-                if (existingIndex >= 0) {
-                  storedDirectories.value[existingIndex] = directory
-                }
-                else {
-                  storedDirectories.value.push(directory)
-                }
-
-                resolve(id)
-              }
-            }
-
-            infoRequest.onerror = () => {
-              console.error('Failed to save directory info:', infoRequest.error)
-              db.close()
-              reject(infoRequest.error)
-            }
-
-            handleRequest.onerror = () => {
-              console.error('Failed to save directory handle:', handleRequest.error)
-              db.close()
-              reject(handleRequest.error)
-            }
-
-            transaction.onerror = () => {
-              console.error('Transaction error:', transaction.error)
-              db.close()
-              reject(transaction.error)
-            }
-          }
-          catch (error) {
-            console.error('Error executing transaction:', error)
-            db.close()
-            reject(error)
-          }
-        }
-
-        executeTransaction()
-      }
-
-      request.onerror = () => {
-        console.error('Database open error:', request.error)
-        reject(request.error)
-      }
-    })
-  }
-  catch (error) {
-    console.warn('无法保存目录:', error)
-    return null
-  }
-}
-
-// 从 IndexedDB 加载所有目录
-async function loadAllDirectories(): Promise<StoredDirectory[]> {
-  try {
-    if (!('indexedDB' in window)) {
-      return []
-    }
-
-    return new Promise((resolve) => {
-      // 使用版本 3 来确保数据库结构正确
-      const request = indexedDB.open('FileSystemDB', 3)
-
-      request.onupgradeneeded = (event) => {
-        const db = request.result
-        const oldVersion = event.oldVersion
-
-        console.log(`Upgrading database from version ${oldVersion} to 3`)
-
-        // 如果存在旧的 handles 表，删除它
-        if (db.objectStoreNames.contains('handles')) {
-          console.log('Deleting old handles object store')
-          db.deleteObjectStore('handles')
-        }
-
-        // 如果存在旧的 directories 表，删除它
-        if (db.objectStoreNames.contains('directories')) {
-          console.log('Deleting old directories object store')
-          db.deleteObjectStore('directories')
-        }
-
-        // 创建新的对象存储
-        if (!db.objectStoreNames.contains('directoryInfo')) {
-          console.log('Creating directoryInfo object store')
-          db.createObjectStore('directoryInfo', { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains('directoryHandles')) {
-          console.log('Creating directoryHandles object store')
-          db.createObjectStore('directoryHandles', { keyPath: 'id' })
-        }
-      }
-
-      request.onsuccess = () => {
-        const db = request.result
-        console.log('Database opened successfully for loading, version:', db.version)
-        console.log('Available object stores:', Array.from(db.objectStoreNames))
-
-        // 创建一个简单的延迟函数
-        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-        const executeTransaction = async () => {
-          // 稍微延迟以确保数据库完全就绪
-          await delay(100)
-
-          try {
-            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readonly')
-            const infoStore = transaction.objectStore('directoryInfo')
-            const handleStore = transaction.objectStore('directoryHandles')
-
-            const infoRequest = infoStore.getAll()
-            const handleRequest = handleStore.getAll()
-
-            let infoResults: any[] = []
-            let handleResults: any[] = []
-            let infoComplete = false
-            let handleComplete = false
-
-            const combineResults = () => {
-              try {
-                const directories: StoredDirectory[] = []
-
-                for (const info of infoResults) {
-                  const handleData = handleResults.find((h) => h.id === info.id)
-                  if (handleData && handleData.handle) {
-                    directories.push({
-                      id: info.id,
-                      name: info.name,
-                      handle: handleData.handle,
-                    })
-                  }
-                }
-
-                console.log('Loaded directories:', directories)
-                db.close()
-                resolve(directories)
-              }
-              catch (error) {
-                console.error('Error combining results:', error)
-                db.close()
-                resolve([])
-              }
-            }
-
-            infoRequest.onsuccess = () => {
-              infoResults = infoRequest.result || []
-              infoComplete = true
-              if (handleComplete) {
-                combineResults()
-              }
-            }
-
-            handleRequest.onsuccess = () => {
-              handleResults = handleRequest.result || []
-              handleComplete = true
-              if (infoComplete) {
-                combineResults()
-              }
-            }
-
-            infoRequest.onerror = () => {
-              console.error('Failed to load directory info:', infoRequest.error)
-              db.close()
-              resolve([])
-            }
-
-            handleRequest.onerror = () => {
-              console.error('Failed to load directory handles:', handleRequest.error)
-              db.close()
-              resolve([])
-            }
-
-            transaction.onerror = () => {
-              console.error('Transaction error:', transaction.error)
-              db.close()
-              resolve([])
-            }
-          }
-          catch (error) {
-            console.error('Error executing transaction:', error)
-            db.close()
-            resolve([])
-          }
-        }
-
-        executeTransaction()
-      }
-
-      request.onerror = () => {
-        console.error('Database open error:', request.error)
-        resolve([])
-      }
-    })
-  }
-  catch (error) {
-    console.warn('无法加载目录列表:', error)
-    return []
-  }
-}
-
-// 删除目录
 async function removeDirectory(id: string) {
-  try {
-    if (!('indexedDB' in window)) {
-      return
-    }
-
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open('FileSystemDB', 3)
-
-      request.onupgradeneeded = (event) => {
-        const db = request.result
-        const oldVersion = event.oldVersion
-
-        console.log(`Upgrading database from version ${oldVersion} to 3`)
-
-        // 如果存在旧的 handles 表，删除它
-        if (db.objectStoreNames.contains('handles')) {
-          console.log('Deleting old handles object store')
-          db.deleteObjectStore('handles')
-        }
-
-        // 如果存在旧的 directories 表，删除它
-        if (db.objectStoreNames.contains('directories')) {
-          console.log('Deleting old directories object store')
-          db.deleteObjectStore('directories')
-        }
-
-        // 创建新的对象存储
-        if (!db.objectStoreNames.contains('directoryInfo')) {
-          console.log('Creating directoryInfo object store')
-          db.createObjectStore('directoryInfo', { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains('directoryHandles')) {
-          console.log('Creating directoryHandles object store')
-          db.createObjectStore('directoryHandles', { keyPath: 'id' })
-        }
-      }
-
-      request.onsuccess = () => {
-        const db = request.result
-
-        // 创建一个简单的延迟函数
-        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-        const executeTransaction = async () => {
-          // 稍微延迟以确保数据库完全就绪
-          await delay(100)
-
-          try {
-            const transaction = db.transaction(['directoryInfo', 'directoryHandles'], 'readwrite')
-            const infoStore = transaction.objectStore('directoryInfo')
-            const handleStore = transaction.objectStore('directoryHandles')
-
-            const infoDeleteRequest = infoStore.delete(id)
-            const handleDeleteRequest = handleStore.delete(id)
-
-            let infoDeleted = false
-            let handleDeleted = false
-
-            infoDeleteRequest.onsuccess = () => {
-              console.log('Directory info deleted successfully')
-              infoDeleted = true
-              if (handleDeleted) {
-                db.close()
-
-                // 更新本地状态
-                storedDirectories.value = storedDirectories.value.filter((d) => d.id !== id)
-
-                resolve(true)
-              }
-            }
-
-            handleDeleteRequest.onsuccess = () => {
-              console.log('Directory handle deleted successfully')
-              handleDeleted = true
-              if (infoDeleted) {
-                db.close()
-
-                // 更新本地状态
-                storedDirectories.value = storedDirectories.value.filter((d) => d.id !== id)
-
-                resolve(true)
-              }
-            }
-
-            infoDeleteRequest.onerror = () => {
-              db.close()
-              reject(infoDeleteRequest.error)
-            }
-
-            handleDeleteRequest.onerror = () => {
-              db.close()
-              reject(handleDeleteRequest.error)
-            }
-
-            transaction.onerror = () => {
-              db.close()
-              reject(transaction.error)
-            }
-          }
-          catch (error) {
-            db.close()
-            reject(error)
-          }
-        }
-
-        executeTransaction()
-      }
-
-      request.onerror = () => {
-        reject(request.error)
-      }
-    })
-  }
-  catch (error) {
-    console.warn('无法删除目录:', error)
-  }
+  await removeDirectoryHandle(id)
+  storedDirectories.value = storedDirectories.value.filter((dir) => dir.id !== id)
 }
 
 // 进入指定目录（用户交互触发）
-async function enterDirectory(directoryData: StoredDirectory) {
+async function enterDirectory(directoryData: StoredDirectoryInfo) {
   loading.value = true
   try {
-    const isValid = await requestDirectoryPermission(directoryData.handle)
-    if (isValid) {
-      directoryHandle.value = directoryData.handle
-      currentDirectory.value = directoryData.handle
-      currentPath.value = directoryData.handle.name
-      currentDirectoryId.value = directoryData.id
+    const directoryHandle = await getDirectoryHandle(directoryData.id)
+    if (directoryHandle && await requestDirectoryPermission(directoryHandle)) {
+      currentPathDirectories.push({ name: directoryData.name, handle: directoryHandle })
       currentView.value = 'directory'
-
-      fileList.value = await listDirectoryEntryItems(directoryData.handle)
+      fileList.value = await listDirectoryEntryItems(directoryHandle)
     }
     else {
       // 权限失效，从列表中移除
@@ -528,13 +70,18 @@ async function enterDirectory(directoryData: StoredDirectory) {
   }
 }
 
+// 进入子目录
+async function enterSubDirectory(item: EntryItem) {
+  if (item.kind === 'directory') {
+    currentPathDirectories.push({ name: item.name, handle: item.handle as FileSystemDirectoryHandle })
+    fileList.value = await listDirectoryEntryItems(item.handle as FileSystemDirectoryHandle)
+  }
+}
+
 // 返回首页
 function goHome() {
   currentView.value = 'home'
-  directoryHandle.value = null
-  currentDirectory.value = null
-  currentPath.value = ''
-  currentDirectoryId.value = null
+  currentPathDirectories.splice(0)
   fileList.value = []
 }
 
@@ -546,16 +93,11 @@ async function addNewDirectory() {
 
     // 检查是否已经添加过这个目录 - 使用 isSameEntry 方法进行精确比较
     let exists = false
-    for (const existingDir of storedDirectories.value) {
-      try {
-        if (await handle.isSameEntry(existingDir.handle)) {
-          exists = true
-          break
-        }
-      }
-      catch (error) {
-        // 如果比较失败（可能是权限问题），继续检查下一个
-        console.warn('无法比较目录句柄:', error)
+    for (const directoryInfo of storedDirectories.value) {
+      const directoryHandle = await getDirectoryHandle(directoryInfo.id)
+      if (await isSameEntry(handle, directoryHandle)) {
+        exists = true
+        break
       }
     }
 
@@ -569,7 +111,11 @@ async function addNewDirectory() {
     }
 
     // 保存目录
-    await saveDirectory(handle)
+    const handleId = await saveDirectoryHandle(handle)
+    storedDirectories.value.push({
+      id: handleId,
+      name: handle.name,
+    })
 
     toast.add({
       title: '目录添加成功',
@@ -620,19 +166,10 @@ function getFileIcon(item: EntryItem): string {
   return iconMap[ext || ''] || '📄'
 }
 
-// 进入子目录
-async function enterSubDirectory(item: EntryItem) {
-  if (item.kind === 'directory') {
-    currentPath.value += `/${item.name}`
-    currentDirectory.value = item.handle as FileSystemDirectoryHandle
-    fileList.value = await listDirectoryEntryItems(item.handle as FileSystemDirectoryHandle)
-  }
-}
-
 // 文件上传功能
 async function handleFileUpload(files: FileList | File[]) {
-  const targetDirectory = currentDirectory.value || directoryHandle.value
-  if (!targetDirectory) {
+  const targetDirectoryHandle = currentPathDirectories.at(-1)?.handle
+  if (!targetDirectoryHandle) {
     toast.add({
       title: '上传失败',
       description: '请先选择一个目录',
@@ -642,7 +179,7 @@ async function handleFileUpload(files: FileList | File[]) {
   }
 
   // 验证写入权限
-  const hasWritePermission = await requestDirectoryPermission(targetDirectory)
+  const hasWritePermission = await requestDirectoryPermission(targetDirectoryHandle)
   if (!hasWritePermission) {
     toast.add({
       title: '权限不足',
@@ -675,7 +212,7 @@ async function handleFileUpload(files: FileList | File[]) {
 
       try {
         // 创建新文件
-        const fileHandle = await createNewFile(targetDirectory, file.name)
+        const fileHandle = await createNewFile(targetDirectoryHandle, file.name)
         await writeFile(fileHandle, file, (progress) => {
           uploadProgress.value[file.name] = Math.round(progress * 100)
         })
@@ -698,7 +235,7 @@ async function handleFileUpload(files: FileList | File[]) {
     }
 
     // 刷新文件列表
-    fileList.value = await listDirectoryEntryItems(targetDirectory)
+    fileList.value = await listDirectoryEntryItems(targetDirectoryHandle)
   }
   finally {
     uploading.value = false
@@ -744,8 +281,8 @@ function handleDrop(e: DragEvent) {
 
 // 删除文件或文件夹
 async function deleteItem(item: EntryItem) {
-  const targetDirectory = currentDirectory.value || directoryHandle.value
-  if (!targetDirectory) {
+  const targetDirectoryHandle = currentPathDirectories.at(-1)?.handle
+  if (!targetDirectoryHandle) {
     toast.add({
       title: '删除失败',
       description: '无法确定当前目录',
@@ -755,7 +292,7 @@ async function deleteItem(item: EntryItem) {
   }
 
   // 验证写入权限
-  const hasWritePermission = await requestDirectoryPermission(targetDirectory)
+  const hasWritePermission = await requestDirectoryPermission(targetDirectoryHandle)
   if (!hasWritePermission) {
     toast.add({
       title: '权限不足',
@@ -781,7 +318,7 @@ async function deleteItem(item: EntryItem) {
     }
 
     // 执行删除操作
-    await targetDirectory.removeEntry(item.name, { recursive: item.kind === 'directory' })
+    await targetDirectoryHandle.removeEntry(item.name, { recursive: item.kind === 'directory' })
 
     toast.add({
       title: '删除成功',
@@ -790,7 +327,7 @@ async function deleteItem(item: EntryItem) {
     })
 
     // 刷新文件列表
-    fileList.value = await listDirectoryEntryItems(targetDirectory)
+    fileList.value = await listDirectoryEntryItems(targetDirectoryHandle)
   }
   catch (error: any) {
     toast.add({
@@ -803,7 +340,7 @@ async function deleteItem(item: EntryItem) {
 
 // 创建新文件夹
 async function createNewFolder() {
-  const targetDirectory = currentDirectory.value || directoryHandle.value
+  const targetDirectory = currentPathDirectories.at(-1)?.handle
   if (!targetDirectory) {
     toast.add({
       title: '创建失败',
@@ -967,40 +504,15 @@ async function downloadFile(item: EntryItem) {
 
 // 返回上级目录
 async function goBack() {
-  if (!directoryHandle.value) {
+  if (currentPathDirectories.length === 1) {
+    goHome()
     return
   }
 
-  const pathParts = currentPath.value.split('/')
-  if (pathParts.length <= 1) {
-    return
-  }
+  currentPathDirectories.pop()
 
-  // 简单实现：重新选择根目录
-  // 实际应用中需要维护目录堆栈
-  pathParts.pop()
-  currentPath.value = pathParts.join('/')
-
-  if (pathParts.length === 1) {
-    currentDirectory.value = directoryHandle.value
-    fileList.value = await listDirectoryEntryItems(directoryHandle.value)
-  }
+  fileList.value = await listDirectoryEntryItems(currentPathDirectories.at(-1)?.handle as FileSystemDirectoryHandle)
 }
-
-// 页面挂载时加载已授权的目录列表
-onMounted(async () => {
-  if (!isFileSystemAccessSupported()) {
-    return
-  }
-
-  try {
-    const directories = await loadAllDirectories()
-    storedDirectories.value = directories
-  }
-  catch (error) {
-    console.warn('加载目录列表失败:', error)
-  }
-})
 </script>
 
 <template>
@@ -1139,7 +651,7 @@ onMounted(async () => {
                   返回首页
                 </UButton>
                 <UButton
-                  v-if="currentPath && currentPath.includes('/')"
+                  v-if="currentPathDirectories.length > 0"
                   :disabled="loading"
                   variant="outline"
                   icon="i-heroicons-arrow-left"
@@ -1148,7 +660,7 @@ onMounted(async () => {
                   返回上级
                 </UButton>
                 <UButton
-                  v-if="directoryHandle"
+                  v-if="currentPathDirectories.length > 0"
                   :disabled="loading || uploading"
                   color="info"
                   icon="i-heroicons-folder-plus"
@@ -1157,7 +669,7 @@ onMounted(async () => {
                   新建文件夹
                 </UButton>
                 <UButton
-                  v-if="directoryHandle"
+                  v-if="currentPathDirectories.length > 0"
                   :disabled="loading || uploading"
                   color="success"
                   icon="i-heroicons-arrow-up-tray"

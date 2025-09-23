@@ -7,8 +7,7 @@ export interface EntryItem {
   type?: string
 }
 
-export interface StoredDirectory {
+export interface StoredDirectoryInfo {
   id: string
   name: string
-  handle: FileSystemDirectoryHandle
 }

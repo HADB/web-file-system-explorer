@@ -1,3 +1,5 @@
+import { del, get, set } from 'idb-keyval'
+
 /**
  * 检查浏览器是否支持文件系统访问API
  * @returns 浏览器是否支持文件系统访问API
@@ -102,6 +104,11 @@ export async function readFile(handle: FileSystemFileHandle) {
   return await handle.getFile()
 }
 
+/**
+ * 列出目录中的所有条目
+ * @param handle 目录句柄
+ * @returns 目录条目数组
+ */
 export async function listDirectoryEntryItems(handle: FileSystemDirectoryHandle) {
   const entryItems: Array<EntryItem> = []
 
@@ -141,4 +148,32 @@ export function formatFileSize(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return `${Number.parseFloat((bytes / (k ** i)).toFixed(2))} ${sizes[i]}`
+}
+
+/**
+ * 保存目录句柄到 IndexedDB
+ * @param handle 目录句柄
+ * @returns 生成的唯一目录 ID
+ */
+export async function saveDirectoryHandle(handle: FileSystemDirectoryHandle) {
+  const id = crypto.randomUUID()
+  await set(id, handle)
+  return id
+}
+
+/**
+ * 获取目录句柄
+ * @param id 目录 ID
+ * @returns 目录句柄
+ */
+export async function getDirectoryHandle(id: string) {
+  return await get<FileSystemDirectoryHandle>(id)
+}
+
+export async function removeDirectoryHandle(id: string) {
+  return await get(id) && await del(id)
+}
+
+export async function isSameEntry(handle1?: FileSystemHandle, handle2?: FileSystemHandle) {
+  return handle1 && handle2 && await handle1.isSameEntry(handle2)
 }
