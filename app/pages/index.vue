@@ -11,25 +11,20 @@ useHead({
   ],
 })
 
-// 应用状态
-const currentView = ref<'home' | 'directory'>('home') // 当前视图：首页或目录浏览
 const storedDirectories = useStorage<StoredDirectoryInfo[]>('storedDirectories', () => [])
+const overlay = useOverlay()
+const toast = useToast()
+
 const currentPathDirectories = reactive<{ name: string, handle: FileSystemDirectoryHandle }[]>([])
 const fileList = ref<EntryItem[]>([])
 const loading = ref(false)
 const uploading = ref(false)
 const uploadProgress = ref<{ [key: string]: number }>({})
-const toast = useToast()
-const currentPath = computed(() => {
-  return currentPathDirectories.map((dir) => dir.name).join('/')
-})
-
-// 使用 useOverlay 创建模态框
-const overlay = useOverlay()
-
-// 拖拽上传相关状态
 const isDragOver = ref(false)
 const uploadQueue = ref<File[]>([])
+
+const currentPath = computed(() => currentPathDirectories.map((dir) => dir.name).join('/'))
+const isHome = computed(() => currentPathDirectories.length === 0)
 
 async function removeDirectory(id: string) {
   await removeDirectoryHandle(id)
@@ -43,7 +38,6 @@ async function enterDirectory(directoryData: StoredDirectoryInfo) {
     const directoryHandle = await getDirectoryHandle(directoryData.id)
     if (directoryHandle && await requestDirectoryPermission(directoryHandle)) {
       currentPathDirectories.push({ name: directoryData.name, handle: directoryHandle })
-      currentView.value = 'directory'
       fileList.value = await listDirectoryEntryItems(directoryHandle)
     }
     else {
@@ -80,7 +74,6 @@ async function enterSubDirectory(item: EntryItem) {
 
 // 返回首页
 function goHome() {
-  currentView.value = 'home'
   currentPathDirectories.splice(0)
   fileList.value = []
 }
@@ -159,6 +152,7 @@ function getFileIcon(item: EntryItem): string {
     svg: '🖼️',
     pdf: '📕',
     mp4: '🎬',
+    mov: '🎬',
     mp3: '🎵',
     zip: '📦',
     rar: '📦',
@@ -534,7 +528,7 @@ async function goBack() {
       />
       <template v-else>
         <!-- 首页：目录列表 -->
-        <div v-if="currentView === 'home'">
+        <div v-if="isHome">
           <!-- 顶部操作栏 -->
           <UCard class="mb-6">
             <div class="flex justify-between items-center">
@@ -631,7 +625,7 @@ async function goBack() {
         </div>
 
         <!-- 目录浏览视图 -->
-        <div v-if="currentView === 'directory'">
+        <div v-if="!isHome">
           <!-- 顶部操作栏 -->
           <UCard class="mb-6">
             <div class="flex justify-between items-center">
