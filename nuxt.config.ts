@@ -1,5 +1,9 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
+  colorMode: {
+    preference: 'dark',
+    fallback: 'dark',
+  },
   compatibilityDate: '2025-07-15',
   css: [
     '~/assets/main.css',
@@ -11,8 +15,14 @@ export default defineNuxtConfig({
   },
   modules: ['@nuxt/eslint', '@nuxt/ui'],
   ssr: false,
-  colorMode: {
-    preference: 'dark',
-    fallback: 'dark',
+  typescript: {
+    typeCheck: true,
+    tsConfig: {
+      compilerOptions: {
+        strict: true,
+        types: ['@types/wicg-file-system-access'],
+      },
+    },
   },
+
 })

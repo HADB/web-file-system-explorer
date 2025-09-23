@@ -1,4 +1,4 @@
-export interface FileItem {
+export interface EntryItem {
   name: string
   kind: 'file' | 'directory'
   handle: FileSystemFileHandle | FileSystemDirectoryHandle
@@ -11,5 +11,4 @@ export interface StoredDirectory {
   id: string
   name: string
   handle: FileSystemDirectoryHandle
-  lastAccessed: Date
 }

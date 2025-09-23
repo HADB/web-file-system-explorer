@@ -1,6 +1,4 @@
 <script setup lang="ts">
-import type { FileItem, StoredDirectory } from '~~/types'
-
 useHead({
   title: '文件浏览器',
   meta: [
@@ -15,7 +13,7 @@ useHead({
 const currentView = ref<'home' | 'directory'>('home') // 当前视图：首页或目录浏览
 const directoryHandle = ref<FileSystemDirectoryHandle | null>(null)
 const currentPath = ref<string>('')
-const fileList = ref<FileItem[]>([])
+const fileList = ref<EntryItem[]>([])
 const loading = ref(false)
 const uploading = ref(false)
 const uploadProgress = ref<{ [key: string]: number }>({})
@@ -45,7 +43,6 @@ async function saveDirectory(handle: FileSystemDirectoryHandle) {
       id,
       name: handle.name,
       handle,
-      lastAccessed: new Date(),
     }
 
     return new Promise((resolve, reject) => {
@@ -103,7 +100,6 @@ async function saveDirectory(handle: FileSystemDirectoryHandle) {
             const serializableInfo = {
               id: directory.id,
               name: directory.name,
-              lastAccessed: directory.lastAccessed,
             }
 
             const handleObject = {
@@ -301,7 +297,6 @@ async function loadAllDirectories(): Promise<StoredDirectory[]> {
                     directories.push({
                       id: info.id,
                       name: info.name,
-                      lastAccessed: new Date(info.lastAccessed),
                       handle: handleData.handle,
                     })
                   }
@@ -495,143 +490,11 @@ async function removeDirectory(id: string) {
   }
 }
 
-// 更新目录最后访问时间
-async function updateDirectoryAccess(id: string) {
-  try {
-    if (!('indexedDB' in window)) {
-      return
-    }
-
-    const directory = storedDirectories.value.find((d) => d.id === id)
-    if (!directory) {
-      return
-    }
-
-    directory.lastAccessed = new Date()
-
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open('FileSystemDB', 3)
-
-      request.onupgradeneeded = (event) => {
-        const db = request.result
-        const oldVersion = event.oldVersion
-
-        console.log(`Upgrading database from version ${oldVersion} to 3`)
-
-        // 如果存在旧的 handles 表，删除它
-        if (db.objectStoreNames.contains('handles')) {
-          console.log('Deleting old handles object store')
-          db.deleteObjectStore('handles')
-        }
-
-        // 如果存在旧的 directories 表，删除它
-        if (db.objectStoreNames.contains('directories')) {
-          console.log('Deleting old directories object store')
-          db.deleteObjectStore('directories')
-        }
-
-        // 创建新的对象存储
-        if (!db.objectStoreNames.contains('directoryInfo')) {
-          console.log('Creating directoryInfo object store')
-          db.createObjectStore('directoryInfo', { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains('directoryHandles')) {
-          console.log('Creating directoryHandles object store')
-          db.createObjectStore('directoryHandles', { keyPath: 'id' })
-        }
-      }
-
-      request.onsuccess = () => {
-        const db = request.result
-
-        // 创建一个简单的延迟函数
-        const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-        const executeTransaction = async () => {
-          // 稍微延迟以确保数据库完全就绪
-          await delay(100)
-
-          try {
-            const transaction = db.transaction(['directoryInfo'], 'readwrite')
-            const infoStore = transaction.objectStore('directoryInfo')
-
-            // 只更新可序列化的信息，不需要更新 handle
-            const serializableInfo = {
-              id: directory.id,
-              name: directory.name,
-              lastAccessed: directory.lastAccessed,
-            }
-
-            const putRequest = infoStore.put(serializableInfo)
-
-            putRequest.onsuccess = () => {
-              console.log('Directory access time updated successfully:', directory.name)
-              db.close()
-              resolve(true)
-            }
-
-            putRequest.onerror = () => {
-              console.error('Failed to update directory access time:', putRequest.error)
-              db.close()
-              reject(putRequest.error)
-            }
-
-            transaction.onerror = () => {
-              console.error('Transaction error:', transaction.error)
-              db.close()
-              reject(transaction.error)
-            }
-          }
-          catch (error) {
-            console.error('Error executing transaction:', error)
-            db.close()
-            reject(error)
-          }
-        }
-
-        executeTransaction()
-      }
-
-      request.onerror = () => {
-        console.error('Database open error:', request.error)
-        reject(request.error)
-      }
-    })
-  }
-  catch (error) {
-    console.warn('无法更新目录访问时间:', error)
-  }
-}
-
-// 验证目录句柄是否仍然有效
-async function verifyDirectoryHandle(handle: FileSystemDirectoryHandle): Promise<boolean> {
-  try {
-    // 尝试获取权限
-    const permission = await (handle as any).queryPermission({ mode: 'readwrite' })
-    if (permission === 'granted') {
-      return true
-    }
-
-    // 如果权限是 'prompt'，尝试请求权限
-    if (permission === 'prompt') {
-      const requestPermission = await (handle as any).requestPermission({ mode: 'readwrite' })
-      return requestPermission === 'granted'
-    }
-
-    return false
-  }
-  catch (error) {
-    console.warn('验证目录句柄失败:', error)
-    return false
-  }
-}
-
 // 进入指定目录（用户交互触发）
 async function enterDirectory(directoryData: StoredDirectory) {
   loading.value = true
   try {
-    const isValid = await verifyDirectoryHandle(directoryData.handle)
+    const isValid = await requestDirectoryPermission(directoryData.handle)
     if (isValid) {
       directoryHandle.value = directoryData.handle
       currentDirectory.value = directoryData.handle
@@ -639,8 +502,7 @@ async function enterDirectory(directoryData: StoredDirectory) {
       currentDirectoryId.value = directoryData.id
       currentView.value = 'directory'
 
-      await loadDirectoryContents(directoryData.handle)
-      await updateDirectoryAccess(directoryData.id)
+      fileList.value = await listDirectoryEntryItems(directoryData.handle)
     }
     else {
       // 权限失效，从列表中移除
@@ -674,52 +536,10 @@ function goHome() {
   currentPath.value = ''
   currentDirectoryId.value = null
   fileList.value = []
-}// 验证目录句柄是否有写入权限
-async function verifyWritePermission(handle: FileSystemDirectoryHandle): Promise<boolean> {
-  try {
-    // 尝试获取写入权限
-    const permission = await (handle as any).queryPermission({ mode: 'readwrite' })
-    if (permission === 'granted') {
-      return true
-    }
-
-    // 如果权限是 'prompt'，尝试请求写入权限
-    if (permission === 'prompt') {
-      const requestPermission = await (handle as any).requestPermission({ mode: 'readwrite' })
-      return requestPermission === 'granted'
-    }
-
-    return false
-  }
-  catch (error) {
-    console.warn('验证写入权限失败:', error)
-    return false
-  }
-}
-
-// 检查浏览器是否支持 File System Access API
-const isSupported = computed(() => {
-  return typeof window !== 'undefined' && 'showDirectoryPicker' in window
-})
-
-// 声明全局接口扩展
-declare global {
-  interface Window {
-    showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>
-  }
 }
 
 // 选择并添加新目录
 async function addNewDirectory() {
-  if (!isSupported.value) {
-    toast.add({
-      title: '浏览器不支持',
-      description: '当前浏览器不支持 File System Access API',
-      color: 'error',
-    })
-    return
-  }
-
   try {
     loading.value = true
     const handle = await window.showDirectoryPicker()
@@ -771,86 +591,8 @@ async function addNewDirectory() {
   }
 }
 
-// 加载目录内容
-async function loadDirectoryContents(handle: FileSystemDirectoryHandle) {
-  try {
-    loading.value = true
-    currentDirectory.value = handle
-    const items: FileItem[] = []
-
-    for await (const [name, itemHandle] of (handle as any).entries()) {
-      const item: FileItem = {
-        name,
-        kind: itemHandle.kind,
-        handle: itemHandle,
-      }
-
-      if (itemHandle.kind === 'file') {
-        const file = await (itemHandle as FileSystemFileHandle).getFile()
-        item.size = file.size
-        item.lastModified = new Date(file.lastModified)
-        item.type = file.type || getFileTypeByExtension(name)
-      }
-
-      items.push(item)
-    }
-
-    // 排序：目录在前，文件在后，然后按名称排序
-    fileList.value = items.sort((a, b) => {
-      if (a.kind !== b.kind) {
-        return a.kind === 'directory' ? -1 : 1
-      }
-      return a.name.localeCompare(b.name)
-    })
-  }
-  catch (error: any) {
-    toast.add({
-      title: '加载目录内容失败',
-      description: error.message,
-      color: 'error',
-    })
-  }
-  finally {
-    loading.value = false
-  }
-}
-
-// 根据文件扩展名获取 MIME 类型
-function getFileTypeByExtension(filename: string): string {
-  const ext = filename.split('.').pop()?.toLowerCase()
-  const mimeTypes: Record<string, string> = {
-    txt: 'text/plain',
-    md: 'text/markdown',
-    js: 'application/javascript',
-    ts: 'application/typescript',
-    json: 'application/json',
-    html: 'text/html',
-    css: 'text/css',
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    svg: 'image/svg+xml',
-    pdf: 'application/pdf',
-    mp4: 'video/mp4',
-    mp3: 'audio/mpeg',
-  }
-  return mimeTypes[ext || ''] || 'application/octet-stream'
-}
-
-// 格式化文件大小
-function formatFileSize(bytes: number): string {
-  if (bytes === 0) {
-    return '0 B'
-  }
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return `${Number.parseFloat((bytes / (k ** i)).toFixed(2))} ${sizes[i]}`
-}
-
 // 获取文件图标
-function getFileIcon(item: FileItem): string {
+function getFileIcon(item: EntryItem): string {
   if (item.kind === 'directory') {
     return '📁'
   }
@@ -879,11 +621,11 @@ function getFileIcon(item: FileItem): string {
 }
 
 // 进入子目录
-async function enterSubDirectory(item: FileItem) {
+async function enterSubDirectory(item: EntryItem) {
   if (item.kind === 'directory') {
     currentPath.value += `/${item.name}`
     currentDirectory.value = item.handle as FileSystemDirectoryHandle
-    await loadDirectoryContents(item.handle as FileSystemDirectoryHandle)
+    fileList.value = await listDirectoryEntryItems(item.handle as FileSystemDirectoryHandle)
   }
 }
 
@@ -900,7 +642,7 @@ async function handleFileUpload(files: FileList | File[]) {
   }
 
   // 验证写入权限
-  const hasWritePermission = await verifyWritePermission(targetDirectory)
+  const hasWritePermission = await requestDirectoryPermission(targetDirectory)
   if (!hasWritePermission) {
     toast.add({
       title: '权限不足',
@@ -933,23 +675,10 @@ async function handleFileUpload(files: FileList | File[]) {
 
       try {
         // 创建新文件
-        const fileHandle = await (targetDirectory as any).getFileHandle(file.name, { create: true })
-        const writable = await (fileHandle as any).createWritable()
-
-        // 分块上传以显示进度
-        const chunkSize = 1024 * 1024 // 1MB chunks
-        const totalChunks = Math.ceil(file.size / chunkSize)
-
-        for (let i = 0; i < totalChunks; i++) {
-          const start = i * chunkSize
-          const end = Math.min(start + chunkSize, file.size)
-          const chunk = file.slice(start, end)
-
-          await writable.write(chunk)
-          uploadProgress.value[file.name] = Math.round(((i + 1) / totalChunks) * 100)
-        }
-
-        await writable.close()
+        const fileHandle = await createNewFile(targetDirectory, file.name)
+        await writeFile(fileHandle, file, (progress) => {
+          uploadProgress.value[file.name] = Math.round(progress * 100)
+        })
         uploadProgress.value[file.name] = 100
 
         toast.add({
@@ -969,7 +698,7 @@ async function handleFileUpload(files: FileList | File[]) {
     }
 
     // 刷新文件列表
-    await loadDirectoryContents(targetDirectory)
+    fileList.value = await listDirectoryEntryItems(targetDirectory)
   }
   finally {
     uploading.value = false
@@ -1014,7 +743,7 @@ function handleDrop(e: DragEvent) {
 }
 
 // 删除文件或文件夹
-async function deleteItem(item: FileItem) {
+async function deleteItem(item: EntryItem) {
   const targetDirectory = currentDirectory.value || directoryHandle.value
   if (!targetDirectory) {
     toast.add({
@@ -1026,7 +755,7 @@ async function deleteItem(item: FileItem) {
   }
 
   // 验证写入权限
-  const hasWritePermission = await verifyWritePermission(targetDirectory)
+  const hasWritePermission = await requestDirectoryPermission(targetDirectory)
   if (!hasWritePermission) {
     toast.add({
       title: '权限不足',
@@ -1052,7 +781,7 @@ async function deleteItem(item: FileItem) {
     }
 
     // 执行删除操作
-    await (targetDirectory as any).removeEntry(item.name, { recursive: item.kind === 'directory' })
+    await targetDirectory.removeEntry(item.name, { recursive: item.kind === 'directory' })
 
     toast.add({
       title: '删除成功',
@@ -1061,7 +790,7 @@ async function deleteItem(item: FileItem) {
     })
 
     // 刷新文件列表
-    await loadDirectoryContents(targetDirectory)
+    fileList.value = await listDirectoryEntryItems(targetDirectory)
   }
   catch (error: any) {
     toast.add({
@@ -1085,7 +814,7 @@ async function createNewFolder() {
   }
 
   // 验证写入权限
-  const hasWritePermission = await verifyWritePermission(targetDirectory)
+  const hasWritePermission = await requestDirectoryPermission(targetDirectory)
   if (!hasWritePermission) {
     toast.add({
       title: '权限不足',
@@ -1116,7 +845,7 @@ async function createNewFolder() {
     }
 
     // 创建新文件夹
-    await (targetDirectory as any).getDirectoryHandle(folderName, { create: true })
+    await createNewDirectory(targetDirectory, folderName)
 
     toast.add({
       title: '创建成功',
@@ -1125,7 +854,7 @@ async function createNewFolder() {
     })
 
     // 刷新文件列表
-    await loadDirectoryContents(targetDirectory)
+    fileList.value = await listDirectoryEntryItems(targetDirectory)
   }
   catch (error: any) {
     toast.add({
@@ -1137,14 +866,14 @@ async function createNewFolder() {
 }
 
 // 预览文件
-async function previewFileContent(item: FileItem) {
+async function previewFileContent(item: EntryItem) {
   if (item.kind === 'directory') {
     return
   }
 
   try {
     const fileHandle = item.handle as FileSystemFileHandle
-    const file = await fileHandle.getFile()
+    const file = await readFile(fileHandle)
 
     let previewType = 'unknown'
     let previewContent = ''
@@ -1208,7 +937,7 @@ function isTextFile(filename: string): boolean {
 }
 
 // 下载文件
-async function downloadFile(item: FileItem) {
+async function downloadFile(item: EntryItem) {
   if (item.kind === 'directory') {
     return
   }
@@ -1254,13 +983,13 @@ async function goBack() {
 
   if (pathParts.length === 1) {
     currentDirectory.value = directoryHandle.value
-    await loadDirectoryContents(directoryHandle.value)
+    fileList.value = await listDirectoryEntryItems(directoryHandle.value)
   }
 }
 
 // 页面挂载时加载已授权的目录列表
 onMounted(async () => {
-  if (!isSupported.value) {
+  if (!isFileSystemAccessSupported()) {
     return
   }
 
@@ -1283,7 +1012,7 @@ onMounted(async () => {
 
       <!-- 浏览器支持提示 -->
       <UAlert
-        v-if="!isSupported"
+        v-if="!isFileSystemAccessSupported()"
         icon="i-heroicons-exclamation-triangle"
         color="error"
         variant="soft"
@@ -1291,317 +1020,315 @@ onMounted(async () => {
         description="当前浏览器不支持 File System Access API，请使用 Chrome 86+ 或 Edge 86+ 浏览器"
         class="mb-6"
       />
-
-      <!-- 首页：目录列表 -->
-      <div v-if="isSupported && currentView === 'home'">
-        <!-- 顶部操作栏 -->
-        <UCard class="mb-6">
-          <div class="flex justify-between items-center">
-            <div class="flex items-center space-x-3">
-              <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
-              <span class="text-lg font-semibold text-gray-200">已授权的目录</span>
+      <template v-else>
+        <!-- 首页：目录列表 -->
+        <div v-if="currentView === 'home'">
+          <!-- 顶部操作栏 -->
+          <UCard class="mb-6">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center space-x-3">
+                <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
+                <span class="text-lg font-semibold text-gray-200">已授权的目录</span>
+              </div>
+              <div class="flex gap-3">
+                <UButton
+                  :loading="loading"
+                  color="primary"
+                  icon="i-heroicons-plus"
+                  @click="addNewDirectory"
+                >
+                  添加目录
+                </UButton>
+              </div>
             </div>
-            <div class="flex gap-3">
+          </UCard>
+
+          <!-- 目录列表 -->
+          <UCard v-if="storedDirectories.length > 0">
+            <template #header>
+              <div class="flex justify-between items-center">
+                <h2 class="text-lg font-semibold">
+                  目录列表
+                </h2>
+                <UBadge color="neutral" variant="subtle">
+                  {{ storedDirectories.length }} 个目录
+                </UBadge>
+              </div>
+            </template>
+
+            <div class="space-y-3">
+              <div
+                v-for="directory in storedDirectories"
+                :key="directory.id"
+                class="flex items-center justify-between p-4 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700 cursor-pointer"
+                @click="enterDirectory(directory)"
+              >
+                <div class="flex items-center space-x-4">
+                  <span class="text-2xl">📁</span>
+                  <div>
+                    <h3 class="font-semibold text-gray-200">
+                      {{ directory.name }}
+                    </h3>
+                  </div>
+                </div>
+                <div class="flex items-center space-x-2">
+                  <UButton
+                    size="xs"
+                    variant="ghost"
+                    color="primary"
+                    icon="i-heroicons-folder-open"
+                    @click.stop="enterDirectory(directory)"
+                  >
+                    进入
+                  </UButton>
+                  <UButton
+                    size="xs"
+                    variant="ghost"
+                    color="error"
+                    icon="i-heroicons-trash"
+                    @click.stop="removeDirectory(directory.id)"
+                  >
+                    移除
+                  </UButton>
+                </div>
+              </div>
+            </div>
+          </UCard>
+
+          <!-- 空状态 -->
+          <UCard v-else>
+            <div class="py-12 text-center">
+              <div class="text-6xl text-gray-600 mb-4">
+                📂
+              </div>
+              <h3 class="text-lg font-semibold text-gray-300 mb-2">
+                还没有授权的目录
+              </h3>
+              <p class="text-gray-400 mb-6">
+                点击"添加目录"按钮来选择并授权一个本地目录
+              </p>
               <UButton
-                :loading="loading"
                 color="primary"
                 icon="i-heroicons-plus"
                 @click="addNewDirectory"
               >
-                添加目录
+                添加第一个目录
               </UButton>
             </div>
-          </div>
-        </UCard>
+          </UCard>
+        </div>
 
-        <!-- 目录列表 -->
-        <UCard v-if="storedDirectories.length > 0">
-          <template #header>
+        <!-- 目录浏览视图 -->
+        <div v-if="currentView === 'directory'">
+          <!-- 顶部操作栏 -->
+          <UCard class="mb-6">
             <div class="flex justify-between items-center">
-              <h2 class="text-lg font-semibold">
-                目录列表
-              </h2>
-              <UBadge color="neutral" variant="subtle">
-                {{ storedDirectories.length }} 个目录
-              </UBadge>
-            </div>
-          </template>
-
-          <div class="space-y-3">
-            <div
-              v-for="directory in storedDirectories"
-              :key="directory.id"
-              class="flex items-center justify-between p-4 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700 cursor-pointer"
-              @click="enterDirectory(directory)"
-            >
-              <div class="flex items-center space-x-4">
-                <span class="text-2xl">📁</span>
-                <div>
-                  <h3 class="font-semibold text-gray-200">
-                    {{ directory.name }}
-                  </h3>
-                  <p class="text-sm text-gray-400">
-                    最后访问: {{ directory.lastAccessed.toLocaleDateString() }}
-                  </p>
-                </div>
+              <div class="flex items-center space-x-3">
+                <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
+                <span class="font-mono bg-gray-800 px-3 py-1 rounded border border-gray-700 text-sm text-gray-200">
+                  {{ currentPath || '未选择目录' }}
+                </span>
               </div>
-              <div class="flex items-center space-x-2">
+              <div class="flex gap-3">
                 <UButton
-                  size="xs"
-                  variant="ghost"
-                  color="primary"
-                  icon="i-heroicons-folder-open"
-                  @click.stop="enterDirectory(directory)"
+                  :disabled="loading"
+                  variant="outline"
+                  icon="i-heroicons-home"
+                  @click="goHome"
                 >
-                  进入
+                  返回首页
                 </UButton>
                 <UButton
-                  size="xs"
-                  variant="ghost"
-                  color="error"
-                  icon="i-heroicons-trash"
-                  @click.stop="removeDirectory(directory.id)"
+                  v-if="currentPath && currentPath.includes('/')"
+                  :disabled="loading"
+                  variant="outline"
+                  icon="i-heroicons-arrow-left"
+                  @click="goBack"
                 >
-                  移除
-                </UButton>
-              </div>
-            </div>
-          </div>
-        </UCard>
-
-        <!-- 空状态 -->
-        <UCard v-else>
-          <div class="py-12 text-center">
-            <div class="text-6xl text-gray-600 mb-4">
-              📂
-            </div>
-            <h3 class="text-lg font-semibold text-gray-300 mb-2">
-              还没有授权的目录
-            </h3>
-            <p class="text-gray-400 mb-6">
-              点击"添加目录"按钮来选择并授权一个本地目录
-            </p>
-            <UButton
-              color="primary"
-              icon="i-heroicons-plus"
-              @click="addNewDirectory"
-            >
-              添加第一个目录
-            </UButton>
-          </div>
-        </UCard>
-      </div>
-
-      <!-- 目录浏览视图 -->
-      <div v-if="isSupported && currentView === 'directory'">
-        <!-- 顶部操作栏 -->
-        <UCard class="mb-6">
-          <div class="flex justify-between items-center">
-            <div class="flex items-center space-x-3">
-              <UIcon name="i-heroicons-folder" class="text-primary-500 text-xl" />
-              <span class="font-mono bg-gray-800 px-3 py-1 rounded border border-gray-700 text-sm text-gray-200">
-                {{ currentPath || '未选择目录' }}
-              </span>
-            </div>
-            <div class="flex gap-3">
-              <UButton
-                :disabled="loading"
-                variant="outline"
-                icon="i-heroicons-home"
-                @click="goHome"
-              >
-                返回首页
-              </UButton>
-              <UButton
-                v-if="currentPath && currentPath.includes('/')"
-                :disabled="loading"
-                variant="outline"
-                icon="i-heroicons-arrow-left"
-                @click="goBack"
-              >
-                返回上级
-              </UButton>
-              <UButton
-                v-if="directoryHandle"
-                :disabled="loading || uploading"
-                color="info"
-                icon="i-heroicons-folder-plus"
-                @click="createNewFolder"
-              >
-                新建文件夹
-              </UButton>
-              <UButton
-                v-if="directoryHandle"
-                :disabled="loading || uploading"
-                color="success"
-                icon="i-heroicons-arrow-up-tray"
-                @click="selectFilesToUpload"
-              >
-                上传文件
-              </UButton>
-            </div>
-          </div>
-        </UCard>
-
-        <!-- 文件列表 -->
-        <UCard
-          class="mb-6"
-          :class="{ 'border-2 border-dashed border-primary-500 bg-primary-50/10': isDragOver }"
-          @dragover="handleDragOver"
-          @dragleave="handleDragLeave"
-          @drop="handleDrop"
-        >
-          <template #header>
-            <div class="flex justify-between items-center">
-              <h2 class="text-lg font-semibold">
-                文件列表
-              </h2>
-              <div class="flex items-center gap-3">
-                <UBadge
-                  v-if="uploading"
-                  color="warning"
-                  variant="subtle"
-                >
-                  正在上传 {{ Object.keys(uploadProgress).length }} 个文件
-                </UBadge>
-                <UBadge color="neutral" variant="subtle">
-                  {{ fileList.length }} 个项目
-                </UBadge>
-              </div>
-            </div>
-          </template>
-
-          <!-- 拖拽上传提示 -->
-          <div
-            v-if="isDragOver"
-            class="absolute inset-0 bg-primary-500/20 flex items-center justify-center z-10 rounded-lg border-2 border-dashed border-primary-500"
-          >
-            <div class="text-center">
-              <UIcon name="i-heroicons-arrow-up-tray" class="text-4xl text-primary-500 mb-2" />
-              <p class="text-lg font-semibold text-primary-600">
-                释放文件以上传
-              </p>
-            </div>
-          </div>
-
-          <!-- 上传进度显示 -->
-          <div v-if="uploading && Object.keys(uploadProgress).length > 0" class="mb-4 p-4 bg-gray-800 rounded-lg">
-            <h3 class="text-sm font-semibold mb-3 text-gray-200">
-              上传进度
-            </h3>
-            <div class="space-y-2">
-              <div
-                v-for="(progress, fileName) in uploadProgress"
-                :key="fileName"
-                class="flex items-center justify-between text-sm"
-              >
-                <span class="text-gray-300 truncate flex-1 mr-3">{{ fileName }}</span>
-                <div class="flex items-center gap-2">
-                  <div class="w-20 bg-gray-700 rounded-full h-2">
-                    <div
-                      class="h-2 rounded-full transition-all duration-300"
-                      :class="{
-                        'bg-green-500': progress === 100,
-                        'bg-red-500': progress === -1,
-                        'bg-blue-500': progress > 0 && progress < 100,
-                        'bg-gray-500': progress === 0,
-                      }"
-                      :style="{ width: `${Math.max(0, progress)}%` }"
-                    />
-                  </div>
-                  <span
-                    class="text-xs w-12 text-right"
-                    :class="{
-                      'text-green-400': progress === 100,
-                      'text-red-400': progress === -1,
-                      'text-blue-400': progress > 0 && progress < 100,
-                      'text-gray-400': progress === 0,
-                    }"
-                  >
-                    {{ progress === -1 ? '跳过' : progress === 0 ? '等待' : `${progress}%` }}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="loading" class="flex justify-center items-center py-12">
-            <UIcon name="i-heroicons-arrow-path" class="animate-spin text-2xl text-primary-500 mr-2" />
-            <span class="text-gray-400">加载中...</span>
-          </div>
-
-          <div v-else-if="fileList.length === 0" class="py-12">
-            <div class="text-center">
-              <div class="text-6xl text-gray-600 mb-4">
-                📁
-              </div>
-              <p class="text-gray-400 text-lg">
-                目录为空
-              </p>
-            </div>
-          </div>
-
-          <div v-else class="space-y-1">
-            <div
-              v-for="item in fileList"
-              :key="item.name"
-              class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700"
-              :class="{ 'cursor-pointer': item.kind === 'directory' }"
-              @click="item.kind === 'directory' ? enterSubDirectory(item) : null"
-            >
-              <div class="flex items-center space-x-3 min-w-0 flex-1">
-                <span class="text-xl flex-shrink-0">{{ getFileIcon(item) }}</span>
-                <div class="min-w-0 flex-1">
-                  <p class="font-mono text-sm truncate text-gray-200">
-                    {{ item.name }}
-                  </p>
-                  <div class="flex items-center space-x-4 text-xs text-gray-400 mt-1">
-                    <UBadge :color="item.kind === 'directory' ? 'primary' : 'neutral'" variant="subtle" size="xs">
-                      {{ item.kind === 'directory' ? '目录' : '文件' }}
-                    </UBadge>
-                    <span v-if="item.kind === 'file' && item.size !== undefined">
-                      {{ formatFileSize(item.size) }}
-                    </span>
-                    <span v-if="item.lastModified">
-                      {{ item.lastModified.toLocaleDateString() }}
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <div class="flex items-center space-x-2 flex-shrink-0">
-                <UButton
-                  v-if="item.kind === 'file'"
-                  size="xs"
-                  variant="ghost"
-                  icon="i-heroicons-eye"
-                  @click.stop="previewFileContent(item)"
-                >
-                  预览
+                  返回上级
                 </UButton>
                 <UButton
-                  v-if="item.kind === 'file'"
-                  size="xs"
-                  variant="ghost"
+                  v-if="directoryHandle"
+                  :disabled="loading || uploading"
+                  color="info"
+                  icon="i-heroicons-folder-plus"
+                  @click="createNewFolder"
+                >
+                  新建文件夹
+                </UButton>
+                <UButton
+                  v-if="directoryHandle"
+                  :disabled="loading || uploading"
                   color="success"
-                  icon="i-heroicons-arrow-down-tray"
-                  @click.stop="downloadFile(item)"
+                  icon="i-heroicons-arrow-up-tray"
+                  @click="selectFilesToUpload"
                 >
-                  下载
-                </UButton>
-                <UButton
-                  size="xs"
-                  variant="ghost"
-                  color="error"
-                  icon="i-heroicons-trash"
-                  @click.stop="deleteItem(item)"
-                >
-                  删除
+                  上传文件
                 </UButton>
               </div>
             </div>
-          </div>
-        </UCard>
-      </div>
+          </UCard>
+
+          <!-- 文件列表 -->
+          <UCard
+            class="mb-6"
+            :class="{ 'border-2 border-dashed border-primary-500 bg-primary-50/10': isDragOver }"
+            @dragover="handleDragOver"
+            @dragleave="handleDragLeave"
+            @drop="handleDrop"
+          >
+            <template #header>
+              <div class="flex justify-between items-center">
+                <h2 class="text-lg font-semibold">
+                  文件列表
+                </h2>
+                <div class="flex items-center gap-3">
+                  <UBadge
+                    v-if="uploading"
+                    color="warning"
+                    variant="subtle"
+                  >
+                    正在上传 {{ Object.keys(uploadProgress).length }} 个文件
+                  </UBadge>
+                  <UBadge color="neutral" variant="subtle">
+                    {{ fileList.length }} 个项目
+                  </UBadge>
+                </div>
+              </div>
+            </template>
+
+            <!-- 拖拽上传提示 -->
+            <div
+              v-if="isDragOver"
+              class="absolute inset-0 bg-primary-500/20 flex items-center justify-center z-10 rounded-lg border-2 border-dashed border-primary-500"
+            >
+              <div class="text-center">
+                <UIcon name="i-heroicons-arrow-up-tray" class="text-4xl text-primary-500 mb-2" />
+                <p class="text-lg font-semibold text-primary-600">
+                  释放文件以上传
+                </p>
+              </div>
+            </div>
+
+            <!-- 上传进度显示 -->
+            <div v-if="uploading && Object.keys(uploadProgress).length > 0" class="mb-4 p-4 bg-gray-800 rounded-lg">
+              <h3 class="text-sm font-semibold mb-3 text-gray-200">
+                上传进度
+              </h3>
+              <div class="space-y-2">
+                <div
+                  v-for="(progress, fileName) in uploadProgress"
+                  :key="fileName"
+                  class="flex items-center justify-between text-sm"
+                >
+                  <span class="text-gray-300 truncate flex-1 mr-3">{{ fileName }}</span>
+                  <div class="flex items-center gap-2">
+                    <div class="w-20 bg-gray-700 rounded-full h-2">
+                      <div
+                        class="h-2 rounded-full transition-all duration-300"
+                        :class="{
+                          'bg-green-500': progress === 100,
+                          'bg-red-500': progress === -1,
+                          'bg-blue-500': progress > 0 && progress < 100,
+                          'bg-gray-500': progress === 0,
+                        }"
+                        :style="{ width: `${Math.max(0, progress)}%` }"
+                      />
+                    </div>
+                    <span
+                      class="text-xs w-12 text-right"
+                      :class="{
+                        'text-green-400': progress === 100,
+                        'text-red-400': progress === -1,
+                        'text-blue-400': progress > 0 && progress < 100,
+                        'text-gray-400': progress === 0,
+                      }"
+                    >
+                      {{ progress === -1 ? '跳过' : progress === 0 ? '等待' : `${progress}%` }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="loading" class="flex justify-center items-center py-12">
+              <UIcon name="i-heroicons-arrow-path" class="animate-spin text-2xl text-primary-500 mr-2" />
+              <span class="text-gray-400">加载中...</span>
+            </div>
+
+            <div v-else-if="fileList.length === 0" class="py-12">
+              <div class="text-center">
+                <div class="text-6xl text-gray-600 mb-4">
+                  📁
+                </div>
+                <p class="text-gray-400 text-lg">
+                  目录为空
+                </p>
+              </div>
+            </div>
+
+            <div v-else class="space-y-1">
+              <div
+                v-for="item in fileList"
+                :key="item.name"
+                class="flex items-center justify-between p-3 rounded-lg hover:bg-gray-800 transition-colors border border-gray-700"
+                :class="{ 'cursor-pointer': item.kind === 'directory' }"
+                @click="item.kind === 'directory' ? enterSubDirectory(item) : null"
+              >
+                <div class="flex items-center space-x-3 min-w-0 flex-1">
+                  <span class="text-xl flex-shrink-0">{{ getFileIcon(item) }}</span>
+                  <div class="min-w-0 flex-1">
+                    <p class="font-mono text-sm truncate text-gray-200">
+                      {{ item.name }}
+                    </p>
+                    <div class="flex items-center space-x-4 text-xs text-gray-400 mt-1">
+                      <UBadge :color="item.kind === 'directory' ? 'primary' : 'neutral'" variant="subtle" size="xs">
+                        {{ item.kind === 'directory' ? '目录' : '文件' }}
+                      </UBadge>
+                      <span v-if="item.kind === 'file' && item.size !== undefined">
+                        {{ formatFileSize(item.size) }}
+                      </span>
+                      <span v-if="item.lastModified">
+                        {{ item.lastModified.toLocaleDateString() }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <div class="flex items-center space-x-2 flex-shrink-0">
+                  <UButton
+                    v-if="item.kind === 'file'"
+                    size="xs"
+                    variant="ghost"
+                    icon="i-heroicons-eye"
+                    @click.stop="previewFileContent(item)"
+                  >
+                    预览
+                  </UButton>
+                  <UButton
+                    v-if="item.kind === 'file'"
+                    size="xs"
+                    variant="ghost"
+                    color="success"
+                    icon="i-heroicons-arrow-down-tray"
+                    @click.stop="downloadFile(item)"
+                  >
+                    下载
+                  </UButton>
+                  <UButton
+                    size="xs"
+                    variant="ghost"
+                    color="error"
+                    icon="i-heroicons-trash"
+                    @click.stop="deleteItem(item)"
+                  >
+                    删除
+                  </UButton>
+                </div>
+              </div>
+            </div>
+          </UCard>
+        </div>
+      </template>
     </div>
   </div>
 </template>
